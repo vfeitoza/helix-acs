@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/raykavin/helix-acs/internal/logger"
 )
@@ -138,6 +139,39 @@ func (s *service) UpdateInfo(ctx context.Context, serial string, upd InfoUpdate)
 		return fmt.Errorf("update device info %s: %w", serial, err)
 	}
 	return nil
+}
+
+// UpdateParameters replaces the device's stored parameters with the given map.
+// It overwrites the entire parameters map (does not merge) and delegates to repo.UpdateParameters.
+func (s *service) UpdateParameters(ctx context.Context, serial string, params map[string]string) error {
+	if err := s.repo.UpdateParameters(ctx, serial, params); err != nil {
+		s.logger.WithError(err).WithField("serial", serial).Error("Failed to update device parameters")
+		return fmt.Errorf("update parameters for device %s: %w", serial, err)
+	}
+	return nil
+}
+
+// MergeParameters merges the given params into the existing parameter map
+// without removing other keys. Use for targeted/partial summons.
+func (s *service) MergeParameters(ctx context.Context, serial string, params map[string]string) error {
+	if err := s.repo.MergeParameters(ctx, serial, params); err != nil {
+		s.logger.WithError(err).WithField("serial", serial).Error("Failed to merge device parameters")
+		return fmt.Errorf("merge parameters for device %s: %w", serial, err)
+	}
+	return nil
+}
+
+// MarkStaleOffline sets online=false for all devices that have not sent an
+// Inform since olderThan. Returns the count of affected devices.
+func (s *service) MarkStaleOffline(ctx context.Context, olderThan time.Time) (int64, error) {
+	count, err := s.repo.MarkStaleOffline(ctx, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("mark stale offline: %w", err)
+	}
+	if count > 0 {
+		s.logger.WithField("count", count).Info("Devices marked offline (no Inform received)")
+	}
+	return count, nil
 }
 
 // SetOnline updates the online presence flag for a device.

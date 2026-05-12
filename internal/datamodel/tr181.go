@@ -155,7 +155,7 @@ func (m *TR181Mapper) WiFiErrorsReceivedPath(bandIdx int) string {
 // WAN
 
 func (m *TR181Mapper) WANConnectionTypePath() string {
-	return fmt.Sprintf("Device.IP.Interface.%d.IPv4Address.1.AddressingType", m.wanIface())
+	return fmt.Sprintf("Device.IP.Interface.%d.X_TP_ConnType", m.wanIface())
 }
 func (m *TR181Mapper) WANPPPoEUserPath() string {
 	return fmt.Sprintf("Device.PPP.Interface.%d.Username", m.pppIface())
@@ -295,3 +295,18 @@ func (m *TR181Mapper) PortMappingCountPath() string {
 func (m *TR181Mapper) WebAdminPasswordPath() string {
 	return "Device.Users.User.1.Password"
 }
+
+// SupportsWiFiAccessPoint returns true for TR-181 which has Device.WiFi.AccessPoint.
+func (m *TR181Mapper) SupportsWiFiAccessPoint() bool {
+	return true
+}
+
+// WANServiceTypePath returns "" for generic TR-181; vendor schemas override this.
+func (m *TR181Mapper) WANServiceTypePath() string { return "" }
+
+// BandSteeringPath returns "" for generic TR-181; vendor schemas override this.
+func (m *TR181Mapper) BandSteeringPath() string { return "" }
+
+// WANProvisioningType returns "set_params" for generic TR-181 devices that
+// have pre-existing WAN objects and only need credential/VLAN updates.
+func (m *TR181Mapper) WANProvisioningType() string { return "set_params" }

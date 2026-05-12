@@ -58,24 +58,59 @@ func (r *mongoRepository) Upsert(ctx context.Context, req *UpsertRequest) (*Devi
 
 	filter := bson.M{"serial": req.Serial}
 
+	// Read existing parameters so we can merge Inform params without
+	// wiping summon-derived data. On first insert, existing will be nil.
+	var existing struct {
+		Parameters map[string]string `bson:"parameters"`
+	}
+	_ = r.col.FindOne(ctx, filter).Decode(&existing)
+
+	mergedParams := req.Parameters
+	if existing.Parameters != nil && len(existing.Parameters) > len(req.Parameters) {
+		// Existing has more params (from summon); merge Inform on top.
+		mergedParams = make(map[string]string, len(existing.Parameters)+len(req.Parameters))
+		for k, v := range existing.Parameters {
+			mergedParams[k] = v
+		}
+		for k, v := range req.Parameters {
+			mergedParams[k] = v
+		}
+	}
+
 	setFields := bson.M{
 		"serial":        req.Serial,
 		"oui":           req.OUI,
 		"manufacturer":  req.Manufacturer,
-		"model_name":    req.ModelName,
 		"product_class": req.ProductClass,
 		"data_model":    req.DataModel,
 		"schema":        req.Schema,
-		"ip_address":    req.IPAddress,
-		"wan_ip":        req.WANIP,
-		"sw_version":    req.SWVersion,
-		"hw_version":    req.HWVersion,
 		"bl_version":    req.BLVersion,
-		"parameters":    req.Parameters,
+		"parameters":    mergedParams,
 		"online":        true,
 		"last_inform":   now,
 		"updated_at":    now,
 	}
+	// Only overwrite ip_address/wan_ip when the Inform provides a non-empty value;
+	// otherwise summon-derived values (from UpdateInfo) would be erased on every Inform
+	// for devices that report minimal params (e.g. Ruijie EW3000P — only 7 Inform params).
+	if req.IPAddress != "" {
+		setFields["ip_address"] = req.IPAddress
+	}
+	if req.WANIP != "" {
+		setFields["wan_ip"] = req.WANIP
+	}
+	// Only overwrite these fields when the Inform provides non-empty values;
+	// otherwise summon-based values (UpdateInfo) would be erased on every Inform.
+	if req.ModelName != "" {
+		setFields["model_name"] = req.ModelName
+	}
+	if req.SWVersion != "" {
+		setFields["sw_version"] = req.SWVersion
+	}
+	if req.HWVersion != "" {
+		setFields["hw_version"] = req.HWVersion
+	}
+
 	// Only overwrite system fields when the CPE reports them.
 	if req.UptimeSeconds > 0 {
 		setFields["uptime_seconds"] = req.UptimeSeconds
@@ -117,8 +152,38 @@ func (r *mongoRepository) UpdateInfo(ctx context.Context, serial string, upd Inf
 
 	setFields := bson.M{"updated_at": time.Now().UTC()}
 
-	if upd.WAN != nil {
-		setFields["wan"] = upd.WAN
+	if upd.UptimeSeconds != nil {
+		setFields["uptime_seconds"] = *upd.UptimeSeconds
+	}
+	if upd.RAMTotal != nil {
+		setFields["ram_total"] = *upd.RAMTotal
+	}
+	if upd.RAMFree != nil {
+		setFields["ram_free"] = *upd.RAMFree
+	}
+	if upd.CPUUsage != nil {
+		setFields["cpu_usage"] = *upd.CPUUsage
+	}
+	if upd.ACSURL != nil {
+		setFields["acs_url"] = *upd.ACSURL
+	}
+	if upd.IPAddress != nil {
+		setFields["ip_address"] = *upd.IPAddress
+	}
+	if upd.WANIP != nil {
+		setFields["wan_ip"] = *upd.WANIP
+	}
+	if upd.ModelName != nil && *upd.ModelName != "" {
+		setFields["model_name"] = *upd.ModelName
+	}
+	if upd.SWVersion != nil && *upd.SWVersion != "" {
+		setFields["sw_version"] = *upd.SWVersion
+	}
+	if upd.HWVersion != nil && *upd.HWVersion != "" {
+		setFields["hw_version"] = *upd.HWVersion
+	}
+	if upd.WANs != nil {
+		setFields["wans"] = upd.WANs
 	}
 	if upd.LAN != nil {
 		setFields["lan"] = upd.LAN
@@ -231,6 +296,26 @@ func (r *mongoRepository) Delete(ctx context.Context, serial string) error {
 	return err
 }
 
+// MarkStaleOffline sets online=false for all devices whose last_inform is
+// older than olderThan. Returns the number of documents updated.
+func (r *mongoRepository) MarkStaleOffline(ctx context.Context, olderThan time.Time) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	res, err := r.col.UpdateMany(
+		ctx,
+		bson.M{
+			"online":      true,
+			"last_inform": bson.M{"$lt": olderThan},
+		},
+		bson.M{"$set": bson.M{"online": false, "updated_at": time.Now().UTC()}},
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.ModifiedCount, nil
+}
+
 // SetOnline updates the online status of a device.
 func (r *mongoRepository) SetOnline(ctx context.Context, serial string, online bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -244,20 +329,53 @@ func (r *mongoRepository) SetOnline(ctx context.Context, serial string, online b
 	return err
 }
 
-// UpdateParameters merges the given parameters map into the device's stored parameters.
+// UpdateParameters replaces the device's stored parameters map with the given map.
 func (r *mongoRepository) UpdateParameters(ctx context.Context, serial string, params map[string]string) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	setFields := bson.M{"updated_at": time.Now().UTC()}
+	_, err := r.col.UpdateOne(
+		ctx,
+		bson.M{"serial": serial},
+		bson.M{"$set": bson.M{
+			"parameters": params,
+			"updated_at": time.Now().UTC(),
+		}},
+	)
+	return err
+}
+
+// MergeParameters merges the given params into the existing parameters map
+// without removing other keys. Use for targeted/partial summons.
+//
+// TR-069 parameter names contain dots (e.g. "Device.WiFi.SSID.1.SSID"),
+// which MongoDB interprets as nested paths in dot-notation $set. We therefore
+// use a read-merge-write approach: load existing params, overlay new ones,
+// then full-replace the parameters map.
+func (r *mongoRepository) MergeParameters(ctx context.Context, serial string, params map[string]string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var existing struct {
+		Parameters map[string]string `bson:"parameters"`
+	}
+	_ = r.col.FindOne(ctx, bson.M{"serial": serial}).Decode(&existing)
+
+	merged := make(map[string]string, len(existing.Parameters)+len(params))
+	for k, v := range existing.Parameters {
+		merged[k] = v
+	}
 	for k, v := range params {
-		setFields["parameters."+k] = v
+		merged[k] = v
 	}
 
 	_, err := r.col.UpdateOne(
 		ctx,
 		bson.M{"serial": serial},
-		bson.M{"$set": setFields},
+		bson.M{"$set": bson.M{
+			"parameters": merged,
+			"updated_at": time.Now().UTC(),
+		}},
 	)
 	return err
 }

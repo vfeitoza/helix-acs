@@ -3,6 +3,7 @@ package api
 import (
 	"io/fs"
 	"net/http"
+	"strconv"
 
 	"github.com/gorilla/mux"
 	"github.com/redis/go-redis/v9"
@@ -13,6 +14,7 @@ import (
 	"github.com/raykavin/helix-acs/internal/auth"
 	"github.com/raykavin/helix-acs/internal/device"
 	"github.com/raykavin/helix-acs/internal/logger"
+	"github.com/raykavin/helix-acs/internal/parameter"
 	"github.com/raykavin/helix-acs/internal/task"
 	webUI "github.com/raykavin/helix-acs/web"
 )
@@ -40,6 +42,7 @@ type Config struct {
 //	PUT    /api/v1/devices/{serial}
 //	DELETE /api/v1/devices/{serial}
 //	GET    /api/v1/devices/{serial}/parameters
+//	GET    /api/v1/devices/{serial}/traffic
 //
 //	POST /api/v1/devices/{serial}/tasks/wifi
 //	POST /api/v1/devices/{serial}/tasks/wan
@@ -59,15 +62,20 @@ func NewRouter(
 	jwtSvc *auth.JWTService,
 	mongoClient *mongo.Client,
 	redisClient *redis.Client,
+	paramRepo parameter.Repository,
+	cwmpTrigger handler.SummonTriggerer,
 	log logger.Logger,
 	cfg Config,
 ) http.Handler {
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(jwtSvc, cfg.ACSUsername, cfg.ACSPassword)
-	deviceHandler := handler.NewDeviceHandler(deviceSvc)
+	deviceHandler := handler.NewDeviceHandler(deviceSvc, paramRepo)
 	taskHandler := handler.NewTaskHandler(taskQueue, deviceSvc, cfg.MaxAttempts)
 	healthHandler := handler.NewHealthHandler(mongoClient, redisClient)
+	snapshotHandler := handler.NewSnapshotHandler(deviceSvc, paramRepo)
+	configHandler := handler.NewConfigHandler(paramRepo)
+	summonHandler := handler.NewSummonHandler(cwmpTrigger)
 
 	// Root router global middleware applied to every route.
 	r := mux.NewRouter()
@@ -94,6 +102,15 @@ func NewRouter(
 	api.HandleFunc("/devices/{serial}", deviceHandler.Update).Methods(http.MethodPut)
 	api.HandleFunc("/devices/{serial}", deviceHandler.Delete).Methods(http.MethodDelete)
 	api.HandleFunc("/devices/{serial}/parameters", deviceHandler.GetParameters).Methods(http.MethodGet)
+	api.HandleFunc("/devices/{serial}/summon", summonHandler.TriggerFullSummon).Methods(http.MethodPost)
+	api.HandleFunc("/devices/{serial}/provision", deviceHandler.GetProvisionInfo).Methods(http.MethodGet)
+
+	// Config / Virtual Parameters API
+	api.HandleFunc("/config/default-params", configHandler.GetDefaultParams).Methods(http.MethodGet)
+	api.HandleFunc("/config/default-params", configHandler.UpdateDefaultParams).Methods(http.MethodPut)
+
+	// Snapshot routes
+	api.HandleFunc("/devices/{serial}/snapshots/last-known-good", snapshotHandler.SaveLastKnownGood).Methods(http.MethodPost)
 
 	// Task creation routes
 	api.HandleFunc("/devices/{serial}/tasks/wifi", taskHandler.CreateWifi).Methods(http.MethodPost)
@@ -118,13 +135,36 @@ func NewRouter(
 	api.HandleFunc("/tasks/{task_id}", taskHandler.Get).Methods(http.MethodGet)
 	api.HandleFunc("/tasks/{task_id}", taskHandler.Cancel).Methods(http.MethodDelete)
 
-	// Web UI static files served from the embedded web/ directory.
-	// Must be registered last so it does not shadow any API routes.
-	webFS, err := fs.Sub(webUI.FS, ".")
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create web UI sub-filesystem")
-	}
-	r.PathPrefix("/").Handler(http.FileServer(http.FS(webFS)))
+	// Embedded UI assets: avoid stale browsers holding old app.js after deploy.
+	r.HandleFunc("/app.js", func(w http.ResponseWriter, r *http.Request) {
+		serveEmbeddedStatic(w, r, "app.js", "application/javascript; charset=utf-8")
+	}).Methods(http.MethodGet, http.MethodHead)
+	r.HandleFunc("/style.css", func(w http.ResponseWriter, r *http.Request) {
+		serveEmbeddedStatic(w, r, "style.css", "text/css; charset=utf-8")
+	}).Methods(http.MethodGet, http.MethodHead)
+
+	// Serve embedded Web UI for direct access.
+	webFS := http.FileServer(http.FS(webUI.FS))
+	r.PathPrefix("/").Handler(http.StripPrefix("/", webFS))
 
 	return r
+}
+
+// serveEmbeddedStatic serves one file from the embedded web UI with headers
+// that discourage long-lived caching (UI is embedded in the binary and
+// changes on every deploy).
+func serveEmbeddedStatic(w http.ResponseWriter, r *http.Request, name, contentType string) {
+	b, err := fs.ReadFile(webUI.FS, name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = w.Write(b)
 }

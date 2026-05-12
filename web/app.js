@@ -23,7 +23,7 @@ const API = {
     const h = { 'Content-Type': 'application/json' };
     if (S.token) h['Authorization'] = 'Bearer ' + S.token;
     const res = await fetch(path, { method, headers: h, body: body != null ? JSON.stringify(body) : undefined });
-    if (res.status === 401) { doLogout(); throw new Error('Não autorizado'); }
+    if (res.status === 401) { doLogout(); throw new Error('Unauthorized'); }
     if (res.status === 204) return null;
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -83,7 +83,7 @@ function applyTheme(theme) {
   }
 
   const btn = document.getElementById('theme-toggle-btn');
-  if (btn) btn.title = theme === 'dark' ? 'Tema claro' : 'Tema escuro';
+  if (btn) btn.title = theme === 'dark' ? 'Light theme' : 'Dark theme';
 }
 
 function toggleTheme() {
@@ -129,7 +129,7 @@ function fmtDate(d) {
   if (!d) return '';
   const dt = new Date(d);
   if (isNaN(dt)) return '';
-  return dt.toLocaleString('pt-BR');
+  return dt.toLocaleString('en-US');
 }
 
 function fmtBytes(bytes) {
@@ -138,6 +138,15 @@ function fmtBytes(bytes) {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+/** Bits per second → human-readable bitrate (for WAN graph axes). */
+function fmtMbpsFromBps(bps) {
+  if (bps == null || !isFinite(bps) || bps <= 0) return '0 Mbps';
+  const mbps = bps / 1e6;
+  if (mbps < 0.01) return (bps / 1e3).toFixed(1) + ' Kbps';
+  if (mbps < 10) return mbps.toFixed(2) + ' Mbps';
+  return mbps.toFixed(1) + ' Mbps';
 }
 
 function fmtUptime(seconds) {
@@ -154,6 +163,8 @@ function fmtRam(totalKB, freeKB) {
   if (!totalKB) return '';
   const usedKB = totalKB - freeKB;
   const pct = Math.round((usedKB / totalKB) * 100);
+  // Percentage-only mode: backend stores Total=100, Free=(100-pct) when only % is available.
+  if (totalKB === 100) return `${pct}%`;
   return `${Math.round(usedKB / 1024)} MB / ${Math.round(totalKB / 1024)} MB (${pct}%)`;
 }
 
@@ -164,13 +175,92 @@ function statusBadge(online) {
 }
 
 function taskStatusBadge(status) {
-  const labels = { pending: 'Pendente', executing: 'Executando', done: 'Concluída', failed: 'Falhou', cancelled: 'Cancelada' };
+  const labels = { pending: 'Pending', executing: 'Executing', done: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
   return `<span class="badge badge-${status}">${labels[status] || status}</span>`;
 }
 
 function tagBadges(tags) {
   if (!tags || tags.length === 0) return '<span class="text-muted small"></span>';
   return tags.map(t => `<span class="tag-badge">${escHtml(t)}</span>`).join('');
+}
+
+// extractOpticalInfo scans all device parameters generically.
+// It finds any path whose parent context relates to optical/GPON/PON/Xpon,
+// then maps known field-name suffixes to canonical optical keys.
+// No brand-specific paths are hardcoded here — this works for any vendor.
+function extractOpticalInfo(params) {
+  if (!params) return null;
+
+  // Canonical field-name suffix → output key.
+  // Covers all known suffix variants across TR-181 and TR-098 vendors.
+  const signalFields = {
+    'RXPower':                 'RXPower',
+    'TXPower':                 'TXPower',
+    'TransceiverTemperature':  'Temperature',
+    'SupplyVoltage':           'SupplyVoltage',
+    'SupplyVottage':           'SupplyVoltage', // known firmware typo
+    'BiasCurrent':             'BiasCurrent',
+    'OpticalSignalLevel':      'OpticalSignalLevel',
+    'TransmitOpticalLevel':    'TransmitOpticalLevel',
+  };
+  const statusFields  = { 'Status': 'Status', 'XponStatus': 'XPONStatus' };
+  const modeFields    = { 'PonType': 'PonType', 'PonMode': 'PonMode' };
+  const fecFields     = { 'FecDsEn': 'FecDownstream', 'FecUsEn': 'FecUpstream' };
+  const statsFields   = {
+    'BytesReceived':   'BytesReceived',
+    'BytesSent':       'BytesSent',
+    'PacketsReceived': 'PacketsReceived',
+    'PacketsSent':     'PacketsSent',
+  };
+
+  // Regex: path segment must contain an optical/PON context keyword.
+  const reOpticalCtx = /optical|gpon|pon|xpon|transceiver/i;
+
+  // Group candidates by parent object path; collect signal fields per group.
+  // A "group" is the full param path minus the last segment (the field name).
+  const groups = {}; // parentPath → { key: value, ... }
+
+  for (const [paramKey, val] of Object.entries(params)) {
+    if (val === undefined || val === null || val === '') continue;
+    const dot = paramKey.lastIndexOf('.');
+    if (dot < 0) continue;
+    const fieldName  = paramKey.substring(dot + 1);
+    const parentPath = paramKey.substring(0, dot);
+    if (!reOpticalCtx.test(parentPath)) continue;
+
+    const allFieldMaps = [signalFields, statusFields, modeFields, fecFields, statsFields];
+    for (const fm of allFieldMaps) {
+      if (fm[fieldName]) {
+        if (!groups[parentPath]) groups[parentPath] = {};
+        groups[parentPath][fm[fieldName]] = val;
+        break;
+      }
+    }
+  }
+
+  if (Object.keys(groups).length === 0) return null;
+
+  // Merge all groups: signal fields win over status/stats. If two groups supply
+  // the same key, prefer the one from a path with Status=Up.
+  const upPaths    = new Set();
+  const merged     = {};
+
+  for (const [path, fields] of Object.entries(groups)) {
+    if (fields['Status'] === 'Up') upPaths.add(path);
+  }
+
+  // Apply: Up-paths first, then the rest (later writes don't overwrite earlier).
+  const orderedPaths = [
+    ...Object.keys(groups).filter(p => upPaths.has(p)),
+    ...Object.keys(groups).filter(p => !upPaths.has(p)),
+  ];
+  for (const path of orderedPaths) {
+    for (const [k, v] of Object.entries(groups[path])) {
+      if (!(k in merged)) merged[k] = v;
+    }
+  }
+
+  return Object.keys(merged).length > 0 ? merged : null;
 }
 
 function escHtml(s) {
@@ -232,6 +322,9 @@ function routeTo(hash) {
   } else if (base === '/devices') {
     setActive('/devices');
     viewDevices();
+  } else if (base === '/default-params') {
+    setActive('/default-params');
+    viewDefaultParams();
   } else if (base === '/health') {
     setActive('/health');
     viewHealth();
@@ -262,7 +355,7 @@ async function viewDashboard() {
       <div class="col-md-6">
         <div class="card border-0 shadow-sm h-100">
           <div class="card-header bg-white fw-semibold">
-            <i class="bi bi-hdd-network me-2 text-primary"></i>Dispositivos Recentes
+            <i class="bi bi-hdd-network me-2 text-primary"></i>Recent Devices
           </div>
           <div id="dash-recent" class="card-body p-0">
             <div class="text-center py-3"><div class="spinner-border spinner-border-sm"></div></div>
@@ -272,7 +365,7 @@ async function viewDashboard() {
       <div class="col-md-6">
         <div class="card border-0 shadow-sm h-100">
           <div class="card-header bg-white fw-semibold">
-            <i class="bi bi-heart-pulse me-2 text-danger"></i>Saúde do Sistema
+            <i class="bi bi-heart-pulse me-2 text-danger"></i>System Health
           </div>
           <div id="dash-health" class="card-body">
             <div class="text-center py-3"><div class="spinner-border spinner-border-sm"></div></div>
@@ -331,8 +424,8 @@ async function viewDashboard() {
               <i class="bi bi-${sysOk ? 'heart-pulse' : 'exclamation-triangle'}"></i>
             </div>
             <div class="stat-body">
-              <div class="stat-value" style="font-size:1.25rem;line-height:1.5">SISTEMA</div>
-              <div class="stat-label">${sysOk ? 'SAUDÁVEL' : 'DEGRADADO'}</div>
+              <div class="stat-value" style="font-size:1.25rem;line-height:1.5">SYSTEM</div>
+              <div class="stat-label">${sysOk ? 'HEALTHY' : 'DEGRADED'}</div>
             </div>
           </div>
         </div>
@@ -349,9 +442,9 @@ async function viewDashboard() {
       </tr>`).join('');
     document.getElementById('dash-recent').innerHTML = rows.length
       ? `<table class="table table-sm table-hover mb-0"><thead><tr>
-           <th>Serial</th><th>Fabricante</th><th>Status</th><th>Último Inform</th>
+           <th>Serial</th><th>Manufacturer</th><th>Status</th><th>Last Inform</th>
          </tr></thead><tbody>${rows}</tbody></table>`
-      : `<div class="empty-state"><i class="bi bi-inbox"></i>Nenhum dispositivo</div>`;
+      : `<div class="empty-state"><i class="bi bi-inbox"></i>No devices</div>`;
 
     // Health
     const mkDot = ok => ok === 'OK'
@@ -361,15 +454,15 @@ async function viewDashboard() {
       <ul class="list-group list-group-flush">
         <li class="list-group-item d-flex align-items-center">
           ${mkDot(healthData.mongodb)}<span>MongoDB</span>
-          <span class="ms-auto badge ${healthData.mongodb==='OK'?'bg-success':'bg-danger'}">${healthData.mongodb === 'OK' ? 'SAUDÁVEL' : 'DEGRADADO'}</span>
+          <span class="ms-auto badge ${healthData.mongodb==='OK'?'bg-success':'bg-danger'}">${healthData.mongodb === 'OK' ? 'HEALTHY' : 'DEGRADED'}</span>
         </li>
         <li class="list-group-item d-flex align-items-center">
           ${mkDot(healthData.redis)}<span>Redis</span>
-          <span class="ms-auto badge ${healthData.redis==='OK'?'bg-success':'bg-danger'}">${healthData.redis === 'OK' ? 'SAUDÁVEL' : 'DEGRADADO'}</span>
+          <span class="ms-auto badge ${healthData.redis==='OK'?'bg-success':'bg-danger'}">${healthData.redis === 'OK' ? 'HEALTHY' : 'DEGRADED'}</span>
         </li>
       </ul>`;
   } catch (e) {
-    toast('Erro ao carregar dashboard: ' + e.message, 'danger');
+    toast('Error loading dashboard: ' + e.message, 'danger');
   }
 }
 
@@ -382,7 +475,7 @@ async function viewDevices() {
 
   el.innerHTML = `
     <div class="d-flex justify-content-between align-items-center mb-3">
-      <h5 class="fw-bold mb-0"><i class="bi bi-hdd-network me-2 text-primary"></i>Dispositivos</h5>
+      <h5 class="fw-bold mb-0"><i class="bi bi-hdd-network me-2 text-primary"></i>Devices</h5>
     </div>
 
     <!-- Filter bar -->
@@ -391,26 +484,26 @@ async function viewDevices() {
         <div class="row g-2 align-items-end">
           <div class="col-sm-2">
             <select class="form-select form-select-sm" id="f-online">
-              <option value="">Todos</option>
+              <option value="">All</option>
               <option value="true" ${f.online==='true'?'selected':''}>Online</option>
               <option value="false" ${f.online==='false'?'selected':''}>Offline</option>
             </select>
           </div>
           <div class="col-sm-2">
-            <input class="form-control form-control-sm" id="f-manufacturer" placeholder="Fabricante" value="${escHtml(f.manufacturer)}">
+            <input class="form-control form-control-sm" id="f-manufacturer" placeholder="Manufacturer" value="${escHtml(f.manufacturer)}">
           </div>
           <div class="col-sm-2">
-            <input class="form-control form-control-sm" id="f-model" placeholder="Modelo" value="${escHtml(f.model)}">
+            <input class="form-control form-control-sm" id="f-model" placeholder="Model" value="${escHtml(f.model)}">
           </div>
           <div class="col-sm-2">
             <input class="form-control form-control-sm" id="f-tag" placeholder="Tag" value="${escHtml(f.tag)}">
           </div>
           <div class="col-sm-2">
-            <input class="form-control form-control-sm" id="f-wan" placeholder="IP WAN" value="${escHtml(f.wan_ip)}">
+            <input class="form-control form-control-sm" id="f-wan" placeholder="WAN IP" value="${escHtml(f.wan_ip)}">
           </div>
           <div class="col-sm-2 d-flex gap-1">
             <button class="btn btn-primary btn-sm flex-fill" onclick="applyDeviceFilter()">
-              <i class="bi bi-search"></i> Filtrar
+              <i class="bi bi-search"></i> Filter
             </button>
             <button class="btn btn-outline-secondary btn-sm" onclick="clearDeviceFilter()">
               <i class="bi bi-x"></i>
@@ -474,7 +567,7 @@ async function loadDevicesTable() {
         <td class="text-muted small">${fmtDate(d.last_inform)}</td>
         <td>${tagBadges(d.tags)}</td>
         <td onclick="event.stopPropagation()">
-          <button class="btn btn-sm btn-outline-danger py-0" title="Deletar"
+          <button class="btn btn-sm btn-outline-danger py-0" title="Delete"
                   onclick="deleteDevice('${escHtml(d.serial)}')">
             <i class="bi bi-trash"></i>
           </button>
@@ -484,12 +577,12 @@ async function loadDevicesTable() {
     const table = rows.length
       ? `<table class="table table-hover align-middle mb-0">
            <thead><tr>
-             <th>Serial</th><th>Fabricante</th><th>Modelo</th><th>Status</th>
-             <th>IP WAN</th><th>Último Inform</th><th>Tags</th><th></th>
+             <th>Serial</th><th>Manufacturer</th><th>Model</th><th>Status</th>
+             <th>WAN IP</th><th>Last Inform</th><th>Tags</th><th></th>
            </tr></thead>
            <tbody>${rows}</tbody>
          </table>`
-      : `<div class="empty-state"><i class="bi bi-inbox"></i>Nenhum dispositivo encontrado</div>`;
+      : `<div class="empty-state"><i class="bi bi-inbox"></i>No devices found</div>`;
 
     // Pagination
     const pages = Array.from({ length: totalPages }, (_, i) => i + 1)
@@ -531,13 +624,35 @@ function changePage(p) {
 }
 
 async function deleteDevice(serial) {
-  confirm(`Deletar dispositivo "${serial}"? Esta ação não pode ser desfeita.`, async () => {
+  confirm(`Delete device "${serial}"? This action cannot be undone.`, async () => {
     try {
       await API.del(`/devices/${encodeURIComponent(serial)}`);
-      toast(`Dispositivo ${serial} deletado.`);
+      toast(`Device ${serial} deleted.`);
       loadDevicesTable();
     } catch (e) { toast(e.message, 'danger'); }
   });
+}
+
+async function triggerSummon(serial) {
+  try {
+    const r = await API.post(`/devices/${encodeURIComponent(serial)}/summon`, {});
+    toast(r.status || 'Full summon scheduled — parameters will refresh on next device contact', 'success');
+  } catch (e) {
+    if (e.message && e.message.includes('503')) {
+      toast('Device not connected — wait for next Inform cycle or check connectivity', 'warning');
+    } else {
+      toast(e.message || 'Failed to trigger summon', 'danger');
+    }
+  }
+}
+
+async function saveSnapshot(serial) {
+  try {
+    const res = await API.post(`/devices/${encodeURIComponent(serial)}/snapshots/last-known-good`, {});
+    toast(`Snapshot saved: ${res.param_count} parameters stored as last_known_good.`, 'success');
+  } catch (e) {
+    toast(e.message || 'Failed to save snapshot', 'danger');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -552,7 +667,7 @@ async function viewDeviceDetail(serial) {
       <button class="btn btn-sm btn-outline-secondary" onclick="navigate('/devices')">
         <i class="bi bi-arrow-left"></i>
       </button>
-      <h5 class="fw-bold mb-0"><i class="bi bi-hdd me-2 text-primary"></i><span id="dev-title">Carregando…</span></h5>
+      <h5 class="fw-bold mb-0"><i class="bi bi-hdd me-2 text-primary"></i><span id="dev-title">Loading…</span></h5>
     </div>
 
     <!-- Device info header card -->
@@ -566,12 +681,12 @@ async function viewDeviceDetail(serial) {
     <ul class="nav nav-tabs mb-3" id="dev-tabs">
       <li class="nav-item">
         <a class="nav-link active" data-bs-toggle="tab" href="#tab-info">
-          <i class="bi bi-info-circle me-1"></i>Informações
+          <i class="bi bi-info-circle me-1"></i>Information
         </a>
       </li>
       <li class="nav-item">
         <a class="nav-link" data-bs-toggle="tab" href="#tab-network">
-          <i class="bi bi-diagram-3 me-1"></i>Rede
+          <i class="bi bi-diagram-3 me-1"></i>Network
         </a>
       </li>
       <li class="nav-item">
@@ -581,12 +696,12 @@ async function viewDeviceDetail(serial) {
       </li>
       <li class="nav-item">
         <a class="nav-link" data-bs-toggle="tab" href="#tab-params" onclick="loadParams()">
-          <i class="bi bi-table me-1"></i>Parâmetros
+          <i class="bi bi-table me-1"></i>Parameters
         </a>
       </li>
       <li class="nav-item">
         <a class="nav-link" data-bs-toggle="tab" href="#tab-tasks" onclick="loadTasks()">
-          <i class="bi bi-list-check me-1"></i>Tarefas
+          <i class="bi bi-list-check me-1"></i>Tasks
         </a>
       </li>
     </ul>
@@ -617,20 +732,21 @@ async function viewDeviceDetail(serial) {
     if (topbarTitle) {
       topbarTitle.innerHTML =
         `<i class="bi bi-hdd-network me-2 text-primary" style="font-size:.9rem"></i>` +
-        `<span class="text-muted fw-normal me-1" style="font-size:.8rem">Dispositivos /</span>` +
+        `<span class="text-muted fw-normal me-1" style="font-size:.8rem">Devices /</span>` +
         `<span>${escHtml(dev.serial)}</span>`;
     }
     renderDeviceHeader(dev);
     renderInfoTab(dev);
-    renderNetworkTab(dev);
+    renderNetworkTab(dev, serial);
   } catch (e) {
-    toast('Erro ao carregar dispositivo: ' + e.message, 'danger');
+    toast('Error while loading device: ' + e.message, 'danger');
   }
 }
 
 function renderDeviceHeader(dev) {
   const uptimeStr = dev.uptime_seconds ? fmtUptime(dev.uptime_seconds) : null;
   const ramStr    = dev.ram_total ? fmtRam(dev.ram_total, dev.ram_free) : null;
+  const cpuStr    = dev.cpu_usage != null ? dev.cpu_usage + '%' : null;
 
   const field = (label, val) => val
     ? `<div class="dev-header-field">
@@ -653,9 +769,30 @@ function renderDeviceHeader(dev) {
           <div class="dev-header-meta">
             ${field('Serial', dev.serial)}
             ${field('Firmware', dev.sw_version)}
-            ${field('IP WAN', dev.wan_ip)}
-            ${field('IP LAN', dev.ip_address)}
+            ${(function(){
+              const mgmtIP = dev.wan_ip || '';
+              const wans = dev.wans || [];
+              // If any WAN IP matches wan_ip, use IP-match to split management vs internet.
+              // Otherwise fall back to service_type token check (TP-Link etc).
+              const anyIPMatch = mgmtIP && wans.some(w => w.ip_address === mgmtIP);
+              const isManagement = w => anyIPMatch
+                ? w.ip_address === mgmtIP
+                : (w.service_type||'').toUpperCase().split(/[,_]/).some(s=>s.trim()==='TR069'||s.trim()==='MANAGEMENT');
+              const internetWAN = wans.find(w => w.ip_address && !isManagement(w));
+              return field('WAN IP', internetWAN ? internetWAN.ip_address : '');
+            })()}
+            ${(function(){
+              const mgmtIP = dev.wan_ip || '';
+              const wans = dev.wans || [];
+              const anyIPMatch = mgmtIP && wans.some(w => w.ip_address === mgmtIP);
+              const isManagement = w => anyIPMatch
+                ? w.ip_address === mgmtIP
+                : (w.service_type||'').toUpperCase().split(/[,_]/).some(s=>s.trim()==='TR069'||s.trim()==='MANAGEMENT');
+              const tr069WAN = wans.find(isManagement);
+              return field('WAN TR069', tr069WAN ? tr069WAN.ip_address : mgmtIP);
+            })()}
             ${field('Uptime', uptimeStr)}
+            ${field('CPU', cpuStr)}
             ${field('RAM', ramStr)}
           </div>
         </div>
@@ -667,26 +804,29 @@ function renderInfoTab(dev) {
   const row = (label, val) =>
     `<tr><td class="text-muted small fw-semibold" style="width:180px">${label}</td><td>${val||''}</td></tr>`;
 
-  document.getElementById('tab-info').innerHTML = `
+  // Build base HTML: Identification + Versions on top row, then Tags + System on second row
+  let baseHtml = `
     <div class="row g-3">
-      <div class="col-md-6">
-        <div class="card border-0 shadow-sm">
-          <div class="card-header bg-white fw-semibold small">Identificação</div>
+      <!-- First row: Identification + Versions -->
+      <div class="col-lg-6">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-header bg-white fw-semibold small">Identification</div>
           <div class="card-body p-0">
             <table class="table table-sm mb-0">
               ${row('Serial', escHtml(dev.serial))}
               ${row('OUI', escHtml(dev.oui))}
-              ${row('Fabricante', escHtml(dev.manufacturer))}
-              ${row('Modelo', escHtml(dev.model_name))}
+              ${row('Manufacturer', escHtml(dev.manufacturer))}
+              ${row('Model', escHtml(dev.model_name || dev.product_class))}
               ${row('Product Class', escHtml(dev.product_class))}
               ${row('Data Model', escHtml(dev.data_model))}
             </table>
           </div>
         </div>
       </div>
-      <div class="col-md-6">
-        <div class="card border-0 shadow-sm">
-          <div class="card-header bg-white fw-semibold small">Versões</div>
+      
+      <div class="col-lg-6">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-header bg-white fw-semibold small">Versions</div>
           <div class="card-body p-0">
             <table class="table table-sm mb-0">
               ${row('Firmware', escHtml(dev.sw_version))}
@@ -696,23 +836,60 @@ function renderInfoTab(dev) {
           </div>
         </div>
       </div>
-      <div class="col-md-6">
-        <div class="card border-0 shadow-sm">
-          <div class="card-header bg-white fw-semibold small">Sistema</div>
+      
+      <!-- Second row: System + Optical Information -->
+      <div class="col-lg-6">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-header bg-white fw-semibold small">System</div>
           <div class="card-body p-0">
             <table class="table table-sm mb-0">
               ${row('Uptime', dev.uptime_seconds ? fmtUptime(dev.uptime_seconds) : null)}
-              ${row('RAM (Uso/Total)', dev.ram_total ? fmtRam(dev.ram_total, dev.ram_free) : null)}
+              ${row('CPU Usage', dev.cpu_usage != null ? dev.cpu_usage + '%' : null)}
+              ${row('RAM (Used/Total)', dev.ram_total ? fmtRam(dev.ram_total, dev.ram_free) : null)}
               ${row('URL ACS', escHtml(dev.acs_url))}
-              ${row('IP LAN', escHtml(dev.ip_address))}
-              ${row('IP WAN', escHtml(dev.wan_ip))}
-              ${row('Último Inform', fmtDate(dev.last_inform))}
-              ${row('Criado em', fmtDate(dev.created_at))}
+              ${(function() {
+                const mgmtIP = dev.wan_ip || '';
+                const wans = dev.wans || [];
+                const anyIPMatch = mgmtIP && wans.some(w => w.ip_address === mgmtIP);
+                const isManagement = w => anyIPMatch
+                  ? w.ip_address === mgmtIP
+                  : (w.service_type || '').toUpperCase().split(/[,_]/).some(s => s.trim() === 'TR069' || s.trim() === 'MANAGEMENT');
+                const tr069WAN = wans.find(isManagement);
+                return row('WAN TR069 IP', tr069WAN ? tr069WAN.ip_address : (mgmtIP || null));
+              })()}
+              <tr>
+                <td class="text-muted small fw-semibold" style="width:180px">WAN IP</td>
+                <td>${(function() {
+                  const mgmtIP = dev.wan_ip || '';
+                  const wans = dev.wans || [];
+                  const anyIPMatch = mgmtIP && wans.some(w => w.ip_address === mgmtIP);
+                  const isManagement = w => anyIPMatch
+                    ? w.ip_address === mgmtIP
+                    : (w.service_type || '').toUpperCase().split(/[,_]/).some(s => s.trim() === 'TR069' || s.trim() === 'MANAGEMENT');
+                  const internetWANs = wans.filter(w => w.ip_address && !isManagement(w));
+                  if (internetWANs.length > 0) {
+                    return internetWANs.map(w => `${escHtml(w.ip_address)} <span class="text-muted">(${escHtml(w.connection_type || 'Unknown')})</span>`).join('<br>');
+                  }
+                  return '';
+                })()}
+                </td>
+              </tr>
+              ${row('Last Inform', fmtDate(dev.last_inform))}
+              ${row('Created at', fmtDate(dev.created_at))}
             </table>
           </div>
         </div>
       </div>
-      <div class="col-md-6">
+      
+      <div class="col-lg-6">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-header bg-white fw-semibold small"><i class="bi bi-lightbulb me-1 text-warning"></i>Optical Information</div>
+          <div class="card-body p-0" id="optical-info-card"></div>
+        </div>
+      </div>
+      
+      <!-- Third row: Tags (at bottom) -->
+      <div class="col-12">
         <div class="card border-0 shadow-sm">
           <div class="card-header bg-white fw-semibold small d-flex justify-content-between align-items-center">
             Tags
@@ -725,90 +902,274 @@ function renderInfoTab(dev) {
           </div>
         </div>
       </div>
+
+      <!-- Fourth row: Maintenance Actions -->
+      <div class="col-12">
+        <div class="card border-0 shadow-sm">
+          <div class="card-header bg-white fw-semibold small"><i class="bi bi-tools me-1 text-secondary"></i>Maintenance</div>
+          <div class="card-body d-flex flex-wrap gap-2">
+            <button class="btn btn-sm btn-outline-success" onclick="saveSnapshot('${escHtml(dev.serial)}')" title="Simpan parameter saat ini sebagai last_known_good snapshot. Snapshot ini digunakan untuk restore otomatis setelah factory reset.">
+              <i class="bi bi-floppy me-1"></i>Save Snapshot (last_known_good)
+            </button>
+            <button class="btn btn-sm btn-outline-primary" onclick="triggerSummon('${escHtml(dev.serial)}')" title="Trigger GetParameterNames full summon — fetches ALL parameters from device. Required for first-time optical/GPON data discovery.">
+              <i class="bi bi-cloud-download me-1"></i>Summon All Parameters
+            </button>
+          </div>
+        </div>
+      </div>
     </div>`;
+
+  document.getElementById('tab-info').innerHTML = baseHtml;
+
+  // Fetch parameters and extract optical info if available
+  API.get(`/devices/${encodeURIComponent(dev.serial)}/parameters`)
+    .then(params => {
+      const opticalInfo = extractOpticalInfo(params);
+      const opticalRow = (label, val) => 
+        `<tr><td class="text-muted small fw-semibold" style="width:180px">${label}</td><td>${val ? escHtml(String(val)) : '-'}</td></tr>`;
+      
+      // Detect if value is already a formatted string (CDATA/ZTE pre-formats values).
+      // TP-Link values are raw integers; CDATA values contain units like "dBm", "V", "mA".
+      const isPreFormatted = (val) => val && /[a-zA-Z]/.test(String(val));
+
+      const formatTemp = (val) => {
+        if (!val) return '-';
+        if (isPreFormatted(val)) return String(val).trim() + ' °C';
+        const str = String(val).trim();
+        // Float value (contains '.') = already in °C (CDATA/ZTE gives actual temperature)
+        // Large integer (>= 1000) = raw ADC register, divide by 256 (TP-Link format)
+        if (str.includes('.')) return parseFloat(str).toFixed(2) + ' °C';
+        const n = parseInt(str);
+        return (n >= 1000 ? n / 256 : n).toFixed(2) + ' °C';
+      };
+      const formatVoltage = (val) => {
+        if (!val) return '-';
+        if (isPreFormatted(val)) return String(val).trim();
+        const str = String(val).trim();
+        if (str.includes('.')) return parseFloat(str).toFixed(3) + ' V';
+        return (parseInt(str) / 1000).toFixed(3) + ' V';
+      };
+      const formatCurrent = (val) => {
+        if (!val) return '-';
+        if (isPreFormatted(val)) return String(val).trim();
+        const str = String(val).trim();
+        if (str.includes('.')) return parseFloat(str).toFixed(2) + ' mA';
+        return (parseInt(str) * 2 / 1000).toFixed(2) + ' mA';
+      };
+      const formatPower = (val) => {
+        if (!val) return '-';
+        if (isPreFormatted(val)) return String(val).trim();
+        const str = String(val).trim();
+        // ZTE (and some other vendors) store TX/RX power already in dBm as a float, e.g. "2.87".
+        // Detect by presence of decimal point — pass through directly.
+        if (str.includes('.')) return parseFloat(str).toFixed(2) + ' dBm';
+        // Integer: check if it's already in dBm (Huawei stores TXPower/RXPower as integer dBm).
+        // Plausible optical dBm range is -50..+20; values outside this are raw 0.1-µW units (TP-Link).
+        const n = parseInt(str);
+        if (!isNaN(n) && n >= -50 && n <= 20) return n.toFixed(2) + ' dBm';
+        // TP-Link style raw value in 0.1-µW units → convert to dBm.
+        const microWatts = n * 0.1;
+        const milliWatts = microWatts / 1000;
+        const dBm = 10 * Math.log10(milliWatts);
+        return isNaN(dBm) ? str : dBm.toFixed(2) + ' dBm';
+      };
+
+      let htmlContent = '';
+
+      if (opticalInfo && Object.keys(opticalInfo).length > 0) {
+        htmlContent = `<table class="table table-sm mb-0" style="margin-top:8px;border-top:1px solid #dee2e6">
+          <tbody>
+            ${opticalInfo.PonMode ? opticalRow('PON Mode', opticalInfo.PonMode) : ''}
+            ${opticalInfo.Status ? opticalRow('Status', opticalInfo.Status) : ''}
+            ${opticalInfo.Temperature ? opticalRow('Temperature', formatTemp(opticalInfo.Temperature)) : ''}
+            ${opticalInfo.SupplyVoltage ? opticalRow('Supply Voltage', formatVoltage(opticalInfo.SupplyVoltage)) : ''}
+            ${opticalInfo.BiasCurrent ? opticalRow('Bias Current', formatCurrent(opticalInfo.BiasCurrent)) : ''}
+            ${opticalInfo.TXPower ? opticalRow('TX Power', formatPower(opticalInfo.TXPower)) : ''}
+            ${opticalInfo.RXPower ? opticalRow('RX Power', formatPower(opticalInfo.RXPower)) : ''}
+            ${opticalInfo.OpticalSignalLevel ? opticalRow('Signal Level', opticalInfo.OpticalSignalLevel) : ''}
+            ${opticalInfo.BytesReceived ? opticalRow('Bytes RX', fmtBytes(opticalInfo.BytesReceived)) : ''}
+            ${opticalInfo.BytesSent ? opticalRow('Bytes TX', fmtBytes(opticalInfo.BytesSent)) : ''}
+          </tbody>
+        </table>`;
+      }
+      
+      const opticalCard = document.getElementById('optical-info-card');
+      if (opticalCard) opticalCard.innerHTML = htmlContent;
+    })
+    .catch(e => {
+      // Silently fail if parameters endpoint not available
+    });
 }
 
-function renderNetworkTab(dev) {
+
+async function renderNetworkTab(dev, serial) {
   const row = (label, val) =>
     `<tr><td class="text-muted small fw-semibold" style="width:180px">${label}</td><td>${escHtml(String(val||''))}</td></tr>`;
 
-  const wanCard = dev.wan ? `
-    <div class="col-md-6">
+  // Fetch stored PPPoE credentials from PostgreSQL (if any).
+  // TP-Link ONTs never return the password via CWMP, so we store it ourselves.
+  let provisionInfo = {};
+  try {
+    provisionInfo = await API.get(`/devices/${encodeURIComponent(serial || dev.serial)}/provision`);
+  } catch (_) { /* non-blocking: silently ignore if endpoint unavailable */ }
+
+  const pppoeUser = provisionInfo.pppoe_username || '';
+  const pppoePass = provisionInfo.pppoe_password || '';
+  const provVLAN  = provisionInfo.vlan_id || '';
+
+  // Store for task modal pre-fill
+  S.provisionInfo = provisionInfo;
+
+  // passRow: always rendered when WAN is PPPoE.
+  // If password is stored → show masked with eye toggle.
+  // If not yet stored → show a helpful hint so user knows to run a WAN task.
+  const passRow = (isPPPoE, stored) => {
+    if (!isPPPoE) return '';
+    if (stored) {
+      return `<tr>
+        <td class="text-muted small fw-semibold" style="width:180px">PPPoE Password</td>
+        <td>
+          <span id="pppoe-pass-val" style="font-family:monospace;letter-spacing:.1em">••••••••</span>
+          <button class="btn btn-link btn-sm py-0 px-1 text-muted" style="font-size:.75rem"
+                  onclick="togglePPPoEPass('${escHtml(stored)}')" title="Show/Hide password">
+            <i class="bi bi-eye" id="pppoe-pass-eye"></i>
+          </button>
+        </td>
+       </tr>`;
+    }
+    // Password not yet captured — explain why and what to do.
+    return `<tr>
+      <td class="text-muted small fw-semibold" style="width:180px">PPPoE Password</td>
+      <td>
+        <span class="text-muted" style="font-size:.8rem">
+          <i class="bi bi-info-circle me-1"></i>Belum tersimpan — jalankan task <strong>WAN Configuration</strong> untuk menangkap password.
+        </span>
+      </td>
+     </tr>`;
+  };
+
+  const vlanBadge = (v) => v
+    ? `<span class="badge bg-light text-dark border ms-1" style="font-size:.7rem">VLAN ${escHtml(v)}</span>`
+    : '';
+
+  let wanCards = '';
+  if (dev.wans && dev.wans.length > 0) {
+    wanCards = dev.wans.map(w => {
+      const isPPPoE = (w.connection_type||'').toLowerCase().includes('pppoe');
+      const displayUser = isPPPoE && pppoeUser ? pppoeUser : w.pppoe_username;
+      const displayPass = isPPPoE ? pppoePass : '';
+      return `
+    <div>
       <div class="card border-0 shadow-sm">
-        <div class="card-header bg-white fw-semibold small"><i class="bi bi-globe me-1 text-primary"></i>WAN</div>
+        <div class="card-header bg-white fw-semibold small">
+          <i class="bi bi-globe me-1 text-primary"></i>WAN (${escHtml(w.connection_type || 'Unknown')})${vlanBadge(isPPPoE ? provVLAN : '')}
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-sm mb-0">
+            ${row('Status', w.link_status)}
+            ${row('Service', w.service_type)}
+            ${row('Type', w.connection_type)}
+            ${row('IP', w.ip_address)}
+            ${row('Subnet', w.subnet_mask)}
+            ${row('Gateway', w.gateway)}
+            ${row('DNS 1', w.dns1)}
+            ${row('DNS 2', w.dns2)}
+            ${row('MAC', w.mac_address)}
+            ${row('MTU', w.mtu || null)}
+            ${row('Uptime WAN', w.uptime_seconds ? fmtUptime(w.uptime_seconds) : null)}
+            ${displayUser ? row('PPPoE Username', displayUser) : ''}
+            ${passRow(isPPPoE, displayPass)}
+          </table>
+        </div>
+        ${w.bytes_sent || w.bytes_received ? `
+        <div class="card-footer bg-white border-top">
+          <small class="text-muted">Traffic  Sent: ${fmtBytes(w.bytes_sent)} · Received: ${fmtBytes(w.bytes_received)}</small>
+        </div>` : ''}
+      </div>
+    </div>`;
+    }).join('');
+  } else if (dev.wan) {
+    // fallback for older db data
+    const isPPPoE = (dev.wan.connection_type||'').toLowerCase().includes('pppoe');
+    const displayUser = isPPPoE && pppoeUser ? pppoeUser : dev.wan.pppoe_username;
+    const displayPass = isPPPoE ? pppoePass : '';
+    wanCards = `
+    <div>
+      <div class="card border-0 shadow-sm">
+        <div class="card-header bg-white fw-semibold small"><i class="bi bi-globe me-1 text-primary"></i>WAN${vlanBadge(isPPPoE ? provVLAN : '')}</div>
         <div class="card-body p-0">
           <table class="table table-sm mb-0">
             ${row('Status', dev.wan.link_status)}
-            ${row('Tipo', dev.wan.connection_type)}
+            ${row('Type', dev.wan.connection_type)}
             ${row('IP', dev.wan.ip_address)}
-            ${row('Máscara', dev.wan.subnet_mask)}
+            ${row('Subnet', dev.wan.subnet_mask)}
             ${row('Gateway', dev.wan.gateway)}
             ${row('DNS 1', dev.wan.dns1)}
             ${row('DNS 2', dev.wan.dns2)}
             ${row('MAC', dev.wan.mac_address)}
             ${row('MTU', dev.wan.mtu || null)}
             ${row('Uptime WAN', dev.wan.uptime_seconds ? fmtUptime(dev.wan.uptime_seconds) : null)}
-            ${dev.wan.pppoe_username ? row('Usuário PPPoE', dev.wan.pppoe_username) : ''}
+            ${displayUser ? row('PPPoE Username', displayUser) : ''}
+            ${passRow(isPPPoE, displayPass)}
           </table>
         </div>
-        ${dev.wan.bytes_sent || dev.wan.bytes_received ? `
-        <div class="card-footer bg-white border-top">
-          <small class="text-muted">Tráfego  Enviado: ${fmtBytes(dev.wan.bytes_sent)} · Recebido: ${fmtBytes(dev.wan.bytes_received)}</small>
-        </div>` : ''}
-      </div>
-    </div>` : `
-    <div class="col-md-6">
-      <div class="card border-0 shadow-sm">
-        <div class="card-header bg-white fw-semibold small"><i class="bi bi-globe me-1 text-primary"></i>WAN</div>
-        <div class="empty-state"><i class="bi bi-info-circle"></i>Execute a tarefa <strong>Estatísticas CPE</strong> para popular os dados WAN.</div>
       </div>
     </div>`;
+  } else {
+    wanCards = `
+    <div>
+      <div class="card border-0 shadow-sm">
+        <div class="card-header bg-white fw-semibold small"><i class="bi bi-globe me-1 text-primary"></i>WAN</div>
+        <div class="empty-state"><i class="bi bi-info-circle"></i>Run the task <strong>CPE Statistics</strong> to populate WAN data.</div>
+      </div>
+    </div>`;
+  }
 
   const lanCard = dev.lan ? `
-    <div class="col-md-6">
+    <div>
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-white fw-semibold small"><i class="bi bi-house me-1 text-success"></i>LAN</div>
         <div class="card-body p-0">
           <table class="table table-sm mb-0">
-            ${row('IP Roteador', dev.lan.ip_address)}
-            ${row('Máscara', dev.lan.subnet_mask)}
-            ${row('DHCP', dev.lan.dhcp_enabled ? 'Habilitado' : 'Desabilitado')}
-            ${dev.lan.dhcp_enabled ? row('Faixa DHCP', `${dev.lan.dhcp_start||''} – ${dev.lan.dhcp_end||''}`) : ''}
+            ${row('Router IP', dev.lan.ip_address)}
+            ${row('Subnet', dev.lan.subnet_mask)}
+            ${row('DHCP', dev.lan.dhcp_enabled ? 'Enabled' : 'Disabled')}
+            ${dev.lan.dhcp_enabled ? row('DHCP Range', `${dev.lan.dhcp_start||''} – ${dev.lan.dhcp_end||''}`) : ''}
             ${row('DNS', dev.lan.dns_servers)}
-            ${row('Concessões ativas', dev.lan.active_leases != null ? dev.lan.active_leases : null)}
+            ${row('Active Leases', dev.lan.active_leases != null ? dev.lan.active_leases : null)}
           </table>
         </div>
       </div>
     </div>` : `
-    <div class="col-md-6">
+    <div>
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-white fw-semibold small"><i class="bi bi-house me-1 text-success"></i>LAN</div>
-        <div class="empty-state"><i class="bi bi-info-circle"></i>Sem dados LAN coletados.</div>
+        <div class="empty-state"><i class="bi bi-info-circle"></i>No LAN data collected.</div>
       </div>
     </div>`;
 
   const wifiCard = (wifi, label, icon) => wifi ? `
-    <div class="col-md-6">
+    <div>
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-white fw-semibold small d-flex justify-content-between">
           <span><i class="bi bi-wifi me-1 ${icon}"></i>${label}</span>
-          <span class="badge ${wifi.enabled ? 'bg-success' : 'bg-secondary'}">${wifi.enabled ? 'Ativo' : 'Inativo'}</span>
+          <span class="badge ${wifi.enabled ? 'bg-success' : 'bg-secondary'}">${wifi.enabled ? 'Active' : 'Inactive'}</span>
         </div>
         <div class="card-body p-0">
           <table class="table table-sm mb-0">
             ${row('SSID', wifi.ssid)}
             ${row('BSSID', wifi.bssid)}
-            ${row('Canal', wifi.channel || null)}
-            ${row('Largura', wifi.channel_width)}
-            ${row('Padrão', wifi.standard)}
-            ${row('Segurança', wifi.security_mode)}
-            ${row('Potência TX', wifi.tx_power ? wifi.tx_power + ' dBm' : null)}
-            ${row('Clientes', wifi.connected_clients != null ? wifi.connected_clients : null)}
+            ${row('Channel', wifi.channel || null)}
+            ${row('Bandwidth', wifi.channel_width)}
+            ${row('Standard', wifi.standard)}
+            ${row('Security', wifi.security_mode)}
+            ${row('TX Power', wifi.tx_power ? wifi.tx_power + '%' : null)}
+            ${row('Clients', wifi.connected_clients != null ? wifi.connected_clients : null)}
           </table>
         </div>
         ${wifi.bytes_sent || wifi.bytes_received ? `
         <div class="card-footer bg-white border-top">
-          <small class="text-muted">Tráfego  Enviado: ${fmtBytes(wifi.bytes_sent)} · Recebido: ${fmtBytes(wifi.bytes_received)}</small>
+          <small class="text-muted">Traffic  Sent: ${fmtBytes(wifi.bytes_sent)} · Received: ${fmtBytes(wifi.bytes_received)}</small>
         </div>` : ''}
       </div>
     </div>` : '';
@@ -817,21 +1178,42 @@ function renderNetworkTab(dev) {
   const wifi5  = wifiCard(dev.wifi_5,  'Wi-Fi 5 GHz',   'text-primary');
 
   const noWifi = (!dev.wifi_24 && !dev.wifi_5) ? `
-    <div class="col-12">
+    <div>
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-white fw-semibold small"><i class="bi bi-wifi me-1 text-warning"></i>Wi-Fi</div>
-        <div class="empty-state"><i class="bi bi-info-circle"></i>Sem dados Wi-Fi coletados. Execute a tarefa <strong>Estatísticas CPE</strong>.</div>
+        <div class="empty-state"><i class="bi bi-info-circle"></i>No WiFi data collected. Run the task <strong>CPE Statistics</strong>.</div>
       </div>
     </div>` : '';
 
   document.getElementById('tab-network').innerHTML = `
     <div class="row g-3">
-      ${wanCard}
-      ${lanCard}
-      ${wifi24}
-      ${wifi5}
-      ${noWifi}
+      <div class="col-md-6 d-flex flex-column gap-3">
+        ${wanCards}
+        ${lanCard}
+      </div>
+      <div class="col-md-6 d-flex flex-column gap-3">
+        ${wifi24}
+        ${wifi5}
+        ${noWifi}
+      </div>
     </div>`;
+
+}
+
+// Toggle PPPoE password visibility in WAN card
+function togglePPPoEPass(pass) {
+  const span = document.getElementById('pppoe-pass-val');
+  const eye  = document.getElementById('pppoe-pass-eye');
+  if (!span) return;
+  if (span.dataset.shown === '1') {
+    span.textContent = '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+    span.dataset.shown = '0';
+    if (eye) { eye.className = 'bi bi-eye'; }
+  } else {
+    span.textContent = pass;
+    span.dataset.shown = '1';
+    if (eye) { eye.className = 'bi bi-eye-slash'; }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -848,8 +1230,8 @@ async function loadHosts() {
       el.innerHTML = `
         <div class="empty-state">
           <i class="bi bi-people"></i>
-          Nenhum host conectado registrado.
-          <div class="mt-2 text-muted small">Execute a tarefa <strong>Dispositivos Conectados</strong> para atualizar.</div>
+          No connected hosts recorded.
+          <div class="mt-2 text-muted small">Run the task <strong>Connected Devices</strong> to update.</div>
         </div>`;
       return;
     }
@@ -859,16 +1241,19 @@ async function loadHosts() {
         <td class="fw-semibold small font-monospace">${escHtml(h.mac||'')}</td>
         <td>${escHtml(h.ip||'')}</td>
         <td>${escHtml(h.hostname||'')}</td>
-        <td><span class="badge ${h.interface==='WiFi'||h.interface==='2.4GHz'||h.interface==='5GHz'?'bg-warning text-dark':'bg-secondary'}">${escHtml(h.interface||'')}</span></td>
+        <td>
+          <span class="badge ${h.interface && h.interface.includes('Wi-Fi') ? 'bg-primary' : 'bg-success'}">${escHtml(h.interface || 'Unknown')}</span>
+          ${h.rssi != null ? `<small class="text-muted ms-1" title="Signal Strength">${h.rssi} dBm</small>` : ''}
+        </td>
         <td>${h.active
-          ? '<span class="badge badge-online"><span class="status-dot dot-online"></span>Ativo</span>'
-          : '<span class="badge badge-offline">Inativo</span>'}</td>
+          ? '<span class="badge badge-online"><span class="status-dot dot-online"></span>Active</span>'
+          : '<span class="badge badge-offline">Inactive</span>'}</td>
         <td class="text-muted small">${h.lease_time > 0 ? fmtUptime(h.lease_time) : ''}</td>
       </tr>`).join('');
 
     el.innerHTML = `
       <div class="d-flex justify-content-between align-items-center mb-2">
-        <span class="fw-semibold small">Hosts Conectados (${hosts.length})</span>
+        <span class="fw-semibold small">Connected Hosts (${hosts.length})</span>
         <button class="btn btn-sm btn-outline-secondary" onclick="delete document.getElementById('tab-hosts').dataset.loaded; loadHosts()">
           <i class="bi bi-arrow-clockwise"></i>
         </button>
@@ -894,7 +1279,6 @@ async function loadHosts() {
 // ─────────────────────────────────────────────────────────────
 async function loadParams() {
   const el = document.getElementById('tab-params');
-  if (el.dataset.loaded) return;
   try {
     const params = await API.get(`/devices/${encodeURIComponent(S.currentSerial)}/parameters`);
     const entries = Object.entries(params || {});
@@ -902,15 +1286,20 @@ async function loadParams() {
     el.innerHTML = `
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-white d-flex justify-content-between align-items-center">
-          <span class="fw-semibold small">Parâmetros TR-069 (${entries.length})</span>
-          <input class="form-control form-control-sm w-auto" id="param-search"
-                 placeholder="Filtrar…" oninput="filterParams()" style="max-width:240px">
+          <span class="fw-semibold small">Parameters TR-069 (${entries.length})</span>
+          <div class="d-flex gap-2 align-items-center">
+            <input class="form-control form-control-sm w-auto" id="param-search"
+                   placeholder="Filter…" oninput="filterParams()" style="max-width:240px">
+            <button class="btn btn-sm btn-outline-secondary" onclick="loadParams()" title="Refresh">
+              <i class="bi bi-arrow-clockwise"></i>
+            </button>
+          </div>
         </div>
         <div class="card-body p-0">
           <div style="max-height:520px;overflow-y:auto">
             <table class="table table-sm table-hover mb-0" id="params-table">
               <thead class="sticky-top bg-white">
-                <tr><th>Parâmetro</th><th>Valor</th></tr>
+                <tr><th>Parameter</th><th>Value</th></tr>
               </thead>
               <tbody id="params-tbody">
                 ${entries.map(([k,v]) =>
@@ -920,11 +1309,10 @@ async function loadParams() {
                    </tr>`).join('')}
               </tbody>
             </table>
-            ${entries.length === 0 ? '<div class="empty-state"><i class="bi bi-inbox"></i>Sem parâmetros</div>' : ''}
+            ${entries.length === 0 ? '<div class="empty-state"><i class="bi bi-inbox"></i>No parameters</div>' : ''}
           </div>
         </div>
       </div>`;
-    el.dataset.loaded = '1';
   } catch (e) {
     el.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
   }
@@ -980,9 +1368,9 @@ async function loadTasks(page = 1) {
 
     el.innerHTML = `
       <div class="d-flex justify-content-between align-items-center mb-2">
-        <span class="fw-semibold small">Histórico de Tarefas (${total})</span>
+        <span class="fw-semibold small">Task History (${total})</span>
         <button class="btn btn-primary btn-sm" onclick="openTaskModal('${escHtml(S.currentSerial)}')">
-          <i class="bi bi-plus-circle me-1"></i>Nova Tarefa
+          <i class="bi bi-plus-circle me-1"></i>New Task
         </button>
       </div>
       <div class="card border-0 shadow-sm">
@@ -990,15 +1378,15 @@ async function loadTasks(page = 1) {
           ${rows.length
             ? `<table class="table table-sm table-hover align-middle mb-0">
                  <thead><tr>
-                   <th>ID</th><th>Tipo</th><th>Status</th>
-                   <th>Criada</th><th>Concluída</th><th>Erro</th><th></th>
+                   <th>ID</th><th>Type</th><th>Status</th>
+                   <th>Created</th><th>Completed</th><th>Error</th><th></th>
                  </tr></thead>
                  <tbody>${rows}</tbody>
                </table>${pagi}`
-            : `<div class="empty-state"><i class="bi bi-list-check"></i>Nenhuma tarefa criada
+            : `<div class="empty-state"><i class="bi bi-list-check"></i>No task created
                  <div class="mt-2">
                    <button class="btn btn-primary btn-sm" onclick="openTaskModal('${escHtml(S.currentSerial)}')">
-                     <i class="bi bi-plus-circle me-1"></i>Criar primeira tarefa
+                     <i class="bi bi-plus-circle me-1"></i>Create first task
                    </button>
                  </div>
                </div>`}
@@ -1024,7 +1412,7 @@ function taskTypeLabel(type) {
   const labels = {
     wifi: 'Wi-Fi', wan: 'WAN', lan: 'LAN', reboot: 'Reboot',
     factory_reset: 'Factory Reset', set_params: 'Set Params', firmware: 'Firmware',
-    web_admin: 'Senha Web',
+    web_admin: 'Web Password',
     diagnostic: 'Diagnostic', ping_test: 'Ping', traceroute: 'Traceroute',
     speed_test: 'Speed Test', connected_devices: 'Hosts', cpe_stats: 'CPE Stats',
     port_forwarding: 'Port Fwd',
@@ -1055,8 +1443,8 @@ function renderTaskResult(t) {
       ).join('');
       return `<div class="task-result">
         <i class="bi bi-map me-1 text-info"></i>
-        <strong>${escHtml(r.host||'')}</strong>  ${r.hop_count||0} saltos
-        <div class="mt-1">${hops || '<span class="text-muted small">sem saltos</span>'}</div>
+        <strong>${escHtml(r.host||'')}</strong>  ${r.hop_count||0} hops
+        <div class="mt-1">${hops || '<span class="text-muted small">no hops</span>'}</div>
       </div>`;
     }
 
@@ -1065,7 +1453,7 @@ function renderTaskResult(t) {
       return `<div class="task-result">
         <i class="bi bi-speedometer me-1 text-warning"></i>
         Download: <strong>${speed} Mbps</strong> ·
-        Duração: ${r.download_duration_ms||0}ms ·
+        Duration: ${r.download_duration_ms||0}ms ·
         Bytes: ${fmtBytes(r.download_bytes_total)}
       </div>`;
     }
@@ -1081,7 +1469,7 @@ function renderTaskResult(t) {
 
     case 'connected_devices': {
       const hosts = Array.isArray(r) ? r : [];
-      if (!hosts.length) return `<div class="task-result text-muted"><i class="bi bi-people me-1"></i>Nenhum host conectado</div>`;
+      if (!hosts.length) return `<div class="task-result text-muted"><i class="bi bi-people me-1"></i>No connected host</div>`;
       const items = hosts.map(h =>
         `<span class="badge bg-light text-dark border me-1">${escHtml(h.hostname||h.ip||h.mac||'?')} (${escHtml(h.interface||'')})</span>`
       ).join('');
@@ -1094,13 +1482,13 @@ function renderTaskResult(t) {
 
     case 'port_forwarding': {
       const rules = Array.isArray(r) ? r : [];
-      if (!rules.length) return `<div class="task-result text-muted"><i class="bi bi-arrows-angle-expand me-1"></i>Sem regras de redirecionamento</div>`;
+      if (!rules.length) return `<div class="task-result text-muted"><i class="bi bi-arrows-angle-expand me-1"></i>No forwarding rules</div>`;
       const items = rules.map(rule =>
         `<div class="small">${rule.enabled ? '✓' : '✗'} ${escHtml(rule.protocol||'TCP')} :${rule.external_port} → ${escHtml(rule.internal_ip||'')}:${rule.internal_port} ${rule.description ? `<span class="text-muted">(${escHtml(rule.description)})</span>` : ''}</div>`
       ).join('');
       return `<div class="task-result">
         <i class="bi bi-arrow-left-right me-1 text-info"></i>
-        <strong>${rules.length}</strong> regra(s):<div class="mt-1">${items}</div>
+        <strong>${rules.length}</strong> rule(s):<div class="mt-1">${items}</div>
       </div>`;
     }
 
@@ -1110,10 +1498,10 @@ function renderTaskResult(t) {
 }
 
 async function cancelTask(taskId) {
-  confirm('Cancelar esta tarefa?', async () => {
+  confirm('Cancel this task?', async () => {
     try {
       await API.del(`/tasks/${taskId}`);
-      toast('Tarefa cancelada.', 'warning');
+      toast('Task cancelled.', 'warning');
       loadTasks(S.taskPage);
     } catch (e) { toast(e.message, 'danger'); }
   });
@@ -1139,15 +1527,217 @@ function openTagsModal(serial, tags) {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  View: Default Params
+// ─────────────────────────────────────────────────────────────
+
+async function viewDefaultParams() {
+  document.getElementById('topbar-title').textContent = 'Default Parameters';
+  const el = document.getElementById('view-content');
+  el.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h5 class="fw-bold mb-0"><i class="bi bi-sliders me-2 text-primary"></i>Default Parameters</h5>
+    </div>
+    <div class="card shadow-sm mb-4">
+      <div class="card-header d-flex align-items-center gap-2">
+        <i class="bi bi-info-circle text-primary"></i>
+        <span class="fw-semibold">About Default Parameters</span>
+      </div>
+      <div class="card-body">
+        <p class="mb-0 text-muted small">
+          Parameters configured here are automatically pushed to a CPE via
+          <strong>SetParameterValues</strong> on its <em>first-ever connection</em> to the ACS
+          or after a <em>factory reset</em> (Bootstrap event).
+          If the device already has the correct value, the parameter is skipped.
+        </p>
+      </div>
+    </div>
+    <div class="card shadow-sm">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="fw-semibold"><i class="bi bi-table me-1"></i>Parameter List</span>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-secondary" onclick="dpAddVirtualRow()" title="Virtual param maps one name to multiple vendor-specific paths">
+            <i class="bi bi-diagram-3 me-1"></i>Add Virtual
+          </button>
+          <button class="btn btn-sm btn-outline-primary" onclick="dpAddRow()">
+            <i class="bi bi-plus-lg me-1"></i>Add Parameter
+          </button>
+        </div>
+      </div>
+      <div class="card-body p-0">
+        <div id="dp-loading" class="text-center p-4">
+          <div class="spinner-border spinner-border-sm text-primary me-2"></div>Loading…
+        </div>
+        <div id="dp-table-wrap" class="d-none">
+          <table class="table table-hover mb-0" id="dp-table">
+            <thead class="table-light">
+              <tr>
+                <th style="width:42px">Type</th>
+                <th style="width:40%">Parameter Path / Name</th>
+                <th>Value</th>
+                <th style="width:48px"></th>
+              </tr>
+            </thead>
+            <tbody id="dp-tbody"></tbody>
+          </table>
+          <datalist id="dp-path-suggestions">
+            <option value="Device.ManagementServer.Username">
+            <option value="Device.ManagementServer.Password">
+            <option value="Device.ManagementServer.PeriodicInformInterval">
+            <option value="Device.ManagementServer.PeriodicInformEnable">
+            <option value="Device.ManagementServer.ConnectionRequestUsername">
+            <option value="Device.ManagementServer.ConnectionRequestPassword">
+            <option value="InternetGatewayDevice.ManagementServer.Username">
+            <option value="InternetGatewayDevice.ManagementServer.Password">
+            <option value="InternetGatewayDevice.ManagementServer.PeriodicInformInterval">
+            <option value="InternetGatewayDevice.ManagementServer.ConnectionRequestUsername">
+            <option value="InternetGatewayDevice.ManagementServer.ConnectionRequestPassword">
+          </datalist>
+          <div id="dp-empty" class="text-center text-muted p-4 d-none">
+            <i class="bi bi-inbox display-6 d-block mb-2 opacity-50"></i>
+            No default parameters configured.
+          </div>
+        </div>
+      </div>
+      <div class="card-footer d-flex justify-content-between align-items-center">
+        <div id="dp-status" class="small text-muted"></div>
+        <button class="btn btn-primary" onclick="dpSave()">
+          <i class="bi bi-floppy me-1"></i>Save Changes
+        </button>
+      </div>
+    </div>`;
+
+  await dpLoad();
+}
+
+async function dpLoad() {
+  try {
+    const data = await API.get('/config/default-params');
+    document.getElementById('dp-loading').classList.add('d-none');
+    document.getElementById('dp-table-wrap').classList.remove('d-none');
+    const tbody = document.getElementById('dp-tbody');
+    tbody.innerHTML = '';
+
+    const entries = Object.entries(data);
+    if (entries.length === 0) {
+      document.getElementById('dp-empty').classList.remove('d-none');
+    } else {
+      document.getElementById('dp-empty').classList.add('d-none');
+      entries.sort((a, b) => a[0].localeCompare(b[0])).forEach(([k, v]) => dpAppendRow(k, v));
+    }
+  } catch (e) {
+    document.getElementById('dp-loading').innerHTML =
+      `<div class="text-danger p-3"><i class="bi bi-exclamation-triangle me-1"></i>${e.message}</div>`;
+  }
+}
+
+function dpAppendRow(path = '', value = '') {
+  // Detect virtual param stored as _vp.* with JSON spec value
+  if (path.startsWith('_vp.')) {
+    let spec = {value: '', candidates: []};
+    try { spec = JSON.parse(value); } catch (_) {}
+    dpAppendVirtualRow(path.slice(4), spec.value || '', (spec.candidates || []).join('\n'));
+    return;
+  }
+  const tbody = document.getElementById('dp-tbody');
+  document.getElementById('dp-empty').classList.add('d-none');
+  const tr = document.createElement('tr');
+  tr.dataset.type = 'standard';
+  tr.innerHTML = `
+    <td><span class="badge bg-secondary bg-opacity-25 text-secondary border" style="font-size:.65rem">STD</span></td>
+    <td><input type="text" class="form-control form-control-sm dp-path" value="${escHtml(path)}"
+         placeholder="Device.ManagementServer.Username" list="dp-path-suggestions"></td>
+    <td><input type="text" class="form-control form-control-sm dp-value" value="${escHtml(value)}"
+         placeholder="value"></td>
+    <td><button class="btn btn-sm btn-outline-danger" onclick="dpRemoveRow(this)">
+         <i class="bi bi-trash3"></i></button></td>`;
+  tbody.appendChild(tr);
+}
+
+function dpAppendVirtualRow(name = '', value = '', candidates = '') {
+  const tbody = document.getElementById('dp-tbody');
+  document.getElementById('dp-empty').classList.add('d-none');
+  const tr = document.createElement('tr');
+  tr.dataset.type = 'virtual';
+  tr.innerHTML = `
+    <td><span class="badge bg-primary bg-opacity-15 text-primary border" style="font-size:.65rem">VP</span></td>
+    <td>
+      <div class="input-group input-group-sm">
+        <span class="input-group-text text-muted" style="font-size:.7rem">_vp.</span>
+        <input type="text" class="form-control form-control-sm dp-vp-name" value="${escHtml(name)}" placeholder="web_admin_password">
+      </div>
+      <textarea class="form-control form-control-sm dp-vp-candidates mt-1" rows="3"
+        placeholder="One candidate path per line:\nInternetGatewayDevice.UserInterface.X_ZTE-COM_WebUserInfo.AdminPassword\nInternetGatewayDevice.User.1.Password"
+        style="font-size:.75rem;font-family:monospace">${escHtml(candidates)}</textarea>
+    </td>
+    <td><input type="text" class="form-control form-control-sm dp-value" value="${escHtml(value)}" placeholder="value to set"></td>
+    <td><button class="btn btn-sm btn-outline-danger" onclick="dpRemoveRow(this)">
+         <i class="bi bi-trash3"></i></button></td>`;
+  tbody.appendChild(tr);
+}
+
+function dpAddRow() {
+  dpAppendRow('', '');
+  const rows = document.querySelectorAll('#dp-tbody tr');
+  if (rows.length) rows[rows.length - 1].querySelector('.dp-path').focus();
+}
+
+function dpAddVirtualRow() {
+  dpAppendVirtualRow('', '', '');
+  const rows = document.querySelectorAll('#dp-tbody tr');
+  if (rows.length) rows[rows.length - 1].querySelector('.dp-vp-name').focus();
+}
+
+function dpRemoveRow(btn) {
+  btn.closest('tr').remove();
+  if (document.querySelectorAll('#dp-tbody tr').length === 0) {
+    document.getElementById('dp-empty').classList.remove('d-none');
+  }
+}
+
+async function dpSave() {
+  const params = {};
+  let hasError = false;
+  document.querySelectorAll('#dp-tbody tr').forEach(tr => {
+    if (tr.dataset.type === 'virtual') {
+      const name = tr.querySelector('.dp-vp-name').value.trim();
+      const value = tr.querySelector('.dp-value').value.trim();
+      const rawCandidates = tr.querySelector('.dp-vp-candidates').value;
+      const candidates = rawCandidates.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!name) { hasError = true; tr.querySelector('.dp-vp-name').classList.add('is-invalid'); return; }
+      tr.querySelector('.dp-vp-name').classList.remove('is-invalid');
+      params['_vp.' + name] = JSON.stringify({value, candidates});
+    } else {
+      const path  = tr.querySelector('.dp-path').value.trim();
+      const value = tr.querySelector('.dp-value').value.trim();
+      if (!path) { hasError = true; tr.querySelector('.dp-path').classList.add('is-invalid'); return; }
+      tr.querySelector('.dp-path').classList.remove('is-invalid');
+      params[path] = value;
+    }
+  });
+  if (hasError) { toast('Fix highlighted rows before saving.', 'danger'); return; }
+
+  const statusEl = document.getElementById('dp-status');
+  statusEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
+  try {
+    await API.put('/config/default-params', params);
+    toast('Default parameters saved.', 'success');
+    statusEl.textContent = `Saved ${Object.keys(params).length} parameter(s).`;
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'danger');
+    statusEl.textContent = '';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  View: Health
 // ─────────────────────────────────────────────────────────────
 async function viewHealth() {
   const el = document.getElementById('view-content');
   el.innerHTML = `
     <div class="d-flex justify-content-between align-items-center mb-4">
-      <h5 class="fw-bold mb-0"><i class="bi bi-heart-pulse me-2 text-danger"></i>Saúde do Sistema</h5>
+      <h5 class="fw-bold mb-0"><i class="bi bi-heart-pulse me-2 text-danger"></i>System Health</h5>
       <button class="btn btn-sm btn-outline-secondary" onclick="viewHealth()">
-        <i class="bi bi-arrow-clockwise"></i> Atualizar
+        <i class="bi bi-arrow-clockwise"></i> Refresh
       </button>
     </div>
     <div id="health-content" class="text-center py-5">
@@ -1162,7 +1752,7 @@ async function viewHealth() {
           <div class="card-body py-4">
             <i class="bi bi-${icon} fs-1 ${status==='OK'?'text-success':'text-danger'}"></i>
             <h5 class="mt-2">${name}</h5>
-            <span class="badge ${status==='OK'?'bg-success':'bg-danger'} fs-6">${status === 'OK' ? 'SAUDÁVEL' : 'DEGRADADO'}</span>
+            <span class="badge ${status==='OK'?'bg-success':'bg-danger'} fs-6">${status === 'OK' ? 'HEALTHY' : 'DEGRADED'}</span>
           </div>
         </div>
       </div>`;
@@ -1174,7 +1764,7 @@ async function viewHealth() {
         ${item('API', h.status, 'server')}
       </div>
       <p class="text-center text-muted small mt-3">
-        Verificado em: ${new Date().toLocaleString('pt-BR')}
+        Verificado em: ${new Date().toLocaleString('en-US')}
       </p>`;
   } catch (e) {
     document.getElementById('health-content').innerHTML =
@@ -1205,29 +1795,38 @@ function renderTaskForm() {
 const TASK_FORMS = {
   wifi: `
     <div class="row g-3">
-      <div class="col-sm-6">
+      <div class="col-sm-4">
         <label class="form-label">Banda</label>
         <select class="form-select" id="tf-band">
           <option value="2.4">2.4 GHz</option>
           <option value="5">5 GHz</option>
+          <option value="steering">2.4 GHz &amp; 5 GHz (band steering)</option>
         </select>
       </div>
-      <div class="col-sm-6">
+      <div class="col-sm-8">
         <label class="form-label">SSID</label>
-        <input class="form-control" id="tf-ssid" placeholder="Nome da rede">
+        <input class="form-control" id="tf-ssid" placeholder="Network name">
       </div>
-      <div class="col-sm-6">
-        <label class="form-label">Senha</label>
-        <input class="form-control" id="tf-pass" type="password" placeholder="Mínimo 8 caracteres">
+      <div class="col-sm-4">
+        <label class="form-label">Security</label>
+        <select class="form-select" id="tf-security" onchange="document.getElementById('tf-pass').disabled = (this.value === 'None')">
+          <option value="WPA2-PSK">WPA2-PSK</option>
+          <option value="WPA-WPA2-PSK">WPA/WPA2-PSK</option>
+          <option value="None">Open (No Password)</option>
+        </select>
+      </div>
+      <div class="col-sm-8">
+        <label class="form-label">Password</label>
+        <input class="form-control" id="tf-pass" type="password" placeholder="Minimum 8 characters">
       </div>
       <div class="col-sm-3">
-        <label class="form-label">Canal</label>
+        <label class="form-label">Channel</label>
         <input class="form-control" id="tf-channel" type="number" placeholder="0=auto" min="0" max="165">
       </div>
-      <div class="col-sm-3 d-flex align-items-end">
+      <div class="col-sm-3 d-flex align-items-end gap-3 flex-wrap">
         <div class="form-check">
           <input class="form-check-input" type="checkbox" id="tf-enabled" checked>
-          <label class="form-check-label">Habilitada</label>
+          <label class="form-check-label">Enabled</label>
         </div>
       </div>
     </div>`,
@@ -1235,7 +1834,7 @@ const TASK_FORMS = {
   wan: `
     <div class="row g-3">
       <div class="col-sm-6">
-        <label class="form-label">Tipo de Conexão</label>
+        <label class="form-label">Connection Type</label>
         <select class="form-select" id="tf-wan-type" onchange="toggleWanFields()">
           <option value="pppoe">PPPoE</option>
           <option value="dhcp">DHCP</option>
@@ -1244,7 +1843,7 @@ const TASK_FORMS = {
       </div>
       <div class="col-sm-3">
         <label class="form-label">VLAN ID</label>
-        <input class="form-control" id="tf-vlan" type="number" placeholder="0=sem VLAN" min="0" max="4094">
+        <input class="form-control" id="tf-vlan" type="number" placeholder="0=no VLAN" min="0" max="4094">
       </div>
       <div class="col-sm-3">
         <label class="form-label">MTU</label>
@@ -1253,12 +1852,21 @@ const TASK_FORMS = {
       <div id="tf-pppoe-fields">
         <div class="row g-3">
           <div class="col-sm-6">
-            <label class="form-label">Usuário PPPoE</label>
+            <label class="form-label">PPPoE Username</label>
             <input class="form-control" id="tf-wan-user" placeholder="usuario@isp.com.br">
           </div>
           <div class="col-sm-6">
-            <label class="form-label">Senha PPPoE</label>
+            <label class="form-label">PPPoE Password</label>
             <input class="form-control" id="tf-wan-pass" type="password">
+          </div>
+          <div class="col-12 mt-2">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="tf-ipv6-en">
+              <label class="form-check-label" for="tf-ipv6-en">
+                <i class="bi bi-globe2 me-1"></i>Enable IPv6 (Dual-Stack)
+              </label>
+              <div class="form-text">When enabled, the WAN connection uses IPv4 + IPv6 dual-stack mode.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -1266,7 +1874,7 @@ const TASK_FORMS = {
         <div class="row g-3">
           <div class="col-sm-6"><label class="form-label">IP</label>
             <input class="form-control" id="tf-wan-ip" placeholder="200.100.50.1"></div>
-          <div class="col-sm-6"><label class="form-label">Máscara</label>
+          <div class="col-sm-6"><label class="form-label">Subnet</label>
             <input class="form-control" id="tf-wan-mask" placeholder="255.255.255.0"></div>
           <div class="col-sm-6"><label class="form-label">Gateway</label>
             <input class="form-control" id="tf-wan-gw" placeholder="200.100.50.254"></div>
@@ -1281,17 +1889,17 @@ const TASK_FORMS = {
   lan: `
     <div class="row g-3">
       <div class="col-sm-6">
-        <label class="form-label">IP do Roteador (LAN)</label>
+        <label class="form-label">Router IP (LAN)</label>
         <input class="form-control" id="tf-lan-ip" placeholder="192.168.1.1">
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Máscara</label>
+        <label class="form-label">Subnet</label>
         <input class="form-control" id="tf-lan-mask" placeholder="255.255.255.0">
       </div>
       <div class="col-12">
         <div class="form-check">
           <input class="form-check-input" type="checkbox" id="tf-dhcp-en" checked onchange="toggleDhcpFields()">
-          <label class="form-check-label fw-semibold">Servidor DHCP habilitado</label>
+          <label class="form-check-label fw-semibold">DHCP Server Enabled</label>
         </div>
       </div>
       <div id="tf-dhcp-fields">
@@ -1302,7 +1910,7 @@ const TASK_FORMS = {
             <input class="form-control" id="tf-dhcp-end" placeholder="192.168.1.200"></div>
           <div class="col-sm-4"><label class="form-label">DNS</label>
             <input class="form-control" id="tf-dhcp-dns" placeholder="8.8.8.8"></div>
-          <div class="col-sm-4"><label class="form-label">Tempo de concessão (s)</label>
+          <div class="col-sm-4"><label class="form-label">Lease Time (s)</label>
             <input class="form-control" id="tf-lease" type="number" placeholder="86400" value="86400"></div>
         </div>
       </div>
@@ -1313,24 +1921,24 @@ const TASK_FORMS = {
       <div class="col-12">
         <div class="alert alert-warning py-2 small">
           <i class="bi bi-info-circle me-1"></i>
-          Suportado apenas em dispositivos <strong>TR-181</strong>. Para TR-098, use
-          <em>Set Parameters</em> com o caminho específico do fabricante.
+          Supported only on <strong>TR-181</strong> devices. For TR-098, use
+          <em>Set Parameters</em> with the path specific to the manufacturer.
         </div>
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Nova senha</label>
+        <label class="form-label">New Password</label>
         <div class="input-group">
           <span class="input-group-text"><i class="bi bi-key"></i></span>
           <input class="form-control" id="tf-webadmin-pass" type="password"
-                 placeholder="Nova senha da interface web" autocomplete="new-password">
+                 placeholder="New web interface password" autocomplete="new-password">
         </div>
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Confirmar senha</label>
+        <label class="form-label">Confirm Password</label>
         <div class="input-group">
           <span class="input-group-text"><i class="bi bi-key-fill"></i></span>
           <input class="form-control" id="tf-webadmin-pass2" type="password"
-                 placeholder="Repita a senha" autocomplete="new-password">
+                 placeholder="Repeat password" autocomplete="new-password">
         </div>
       </div>
     </div>`,
@@ -1338,22 +1946,22 @@ const TASK_FORMS = {
   reboot: `
     <div class="alert alert-warning">
       <i class="bi bi-exclamation-triangle me-2"></i>
-      O dispositivo será reiniciado no próximo Inform. Conexões ativas serão interrompidas.
+      The device will reboot on next Inform. Active connections will be interrupted.
     </div>`,
 
   'factory-reset': `
     <div class="alert alert-danger">
       <i class="bi bi-exclamation-octagon me-2"></i>
-      <strong>Atenção!</strong> Todas as configurações do dispositivo serão apagadas e ele
-      voltará às configurações de fábrica.
+      <strong>Warning!</strong> All device settings will be erased and it
+      will return to factory settings.
     </div>`,
 
   parameters: `
     <div>
-      <label class="form-label fw-semibold">Parâmetros TR-069</label>
+      <label class="form-label fw-semibold">Parameters TR-069</label>
       <div id="kv-container"></div>
       <button type="button" class="btn btn-sm btn-outline-secondary mt-2" onclick="addKvRow()">
-        <i class="bi bi-plus"></i> Adicionar parâmetro
+        <i class="bi bi-plus"></i> Add parameter
       </button>
     </div>`,
 
@@ -1364,22 +1972,22 @@ const TASK_FORMS = {
         <input class="form-control" id="tf-fw-url" placeholder="http://files.isp.com.br/firmware-v2.bin">
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Versão (informativo)</label>
+        <label class="form-label">Version (informational)</label>
         <input class="form-control" id="tf-fw-version" placeholder="2.0.1">
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Tipo de arquivo</label>
+        <label class="form-label">File Type</label>
         <select class="form-select" id="tf-fw-type">
           <option value="1 Firmware Upgrade Image">Firmware</option>
-          <option value="3 Vendor Configuration File">Configuração</option>
+          <option value="3 Vendor Configuration File">Configuration</option>
         </select>
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Usuário (servidor HTTP)</label>
+        <label class="form-label">User (HTTP server)</label>
         <input class="form-control" id="tf-fw-user" placeholder="Opcional">
       </div>
       <div class="col-sm-6">
-        <label class="form-label">Senha</label>
+        <label class="form-label">Password</label>
         <input class="form-control" id="tf-fw-pass" type="password">
       </div>
     </div>`,
@@ -1391,7 +1999,7 @@ const TASK_FORMS = {
         <input class="form-control" id="tf-ping-host" placeholder="8.8.8.8">
       </div>
       <div class="col-sm-3">
-        <label class="form-label">Contagem</label>
+        <label class="form-label">Count</label>
         <input class="form-control" id="tf-ping-count" type="number" value="4" min="1" max="100">
       </div>
       <div class="col-sm-3">
@@ -1399,7 +2007,7 @@ const TASK_FORMS = {
         <input class="form-control" id="tf-ping-timeout" type="number" value="5" min="1" max="60">
       </div>
       <div class="col-sm-3">
-        <label class="form-label">Tamanho pacote (bytes)</label>
+        <label class="form-label">Packet size (bytes)</label>
         <input class="form-control" id="tf-ping-size" type="number" value="64" min="1" max="65535">
       </div>
       <div class="col-sm-3">
@@ -1415,7 +2023,7 @@ const TASK_FORMS = {
         <input class="form-control" id="tf-tr-host" placeholder="8.8.8.8">
       </div>
       <div class="col-sm-3">
-        <label class="form-label">Máx. Hops</label>
+        <label class="form-label">Max Hops</label>
         <input class="form-control" id="tf-tr-maxhops" type="number" value="30" min="1" max="64">
       </div>
       <div class="col-sm-3">
@@ -1427,41 +2035,41 @@ const TASK_FORMS = {
   'speed-test': `
     <div class="row g-3">
       <div class="col-12">
-        <label class="form-label">URL de Download <span class="text-danger">*</span></label>
+        <label class="form-label">Download URL <span class="text-danger">*</span></label>
         <input class="form-control" id="tf-st-url" placeholder="http://speedtest.tele2.net/10MB.zip">
-        <div class="form-text">Use um arquivo de pelo menos 5–10 MB para resultados precisos.</div>
+        <div class="form-text">Use a file of at least 5–10 MB for accurate results.</div>
       </div>
     </div>`,
 
   'connected-devices': `
     <div class="alert alert-info">
       <i class="bi bi-people me-2"></i>
-      Coleta a lista de hosts conectados (LAN + Wi-Fi) do dispositivo.
-      O resultado ficará disponível na aba <strong>Hosts</strong>.
+      Collects the list of connected hosts (LAN + Wi-Fi) from the device.
+      The result will be available in the <strong>Hosts</strong> tab.
     </div>`,
 
   'cpe-stats': `
     <div class="alert alert-info">
       <i class="bi bi-bar-chart me-2"></i>
-      Coleta estatísticas do CPE: uptime, uso de RAM, contadores WAN e informações
-      de rede. Os dados serão atualizados nas abas <strong>Informações</strong> e <strong>Rede</strong>.
+      Collects CPE statistics: uptime, RAM usage, WAN counters and network
+      information. The data will be updated in the <strong>Information</strong> and <strong>Network</strong> tabs.
     </div>`,
 
   'port-forwarding': `
     <div class="row g-3">
       <div class="col-sm-4">
-        <label class="form-label">Ação</label>
+        <label class="form-label">Action</label>
         <select class="form-select" id="tf-pf-action" onchange="togglePortForwardingFields()">
-          <option value="list">Listar regras</option>
-          <option value="add">Adicionar regra</option>
-          <option value="remove">Remover regra</option>
+          <option value="list">List rules</option>
+          <option value="add">Add rule</option>
+          <option value="remove">Remove rule</option>
         </select>
       </div>
 
       <div id="tf-pf-add-fields" style="display:none" class="col-12">
         <div class="row g-3">
           <div class="col-sm-3">
-            <label class="form-label">Protocolo</label>
+            <label class="form-label">Protocol</label>
             <select class="form-select" id="tf-pf-proto">
               <option value="TCP">TCP</option>
               <option value="UDP">UDP</option>
@@ -1469,25 +2077,25 @@ const TASK_FORMS = {
             </select>
           </div>
           <div class="col-sm-3">
-            <label class="form-label">Porta Externa <span class="text-danger">*</span></label>
+            <label class="form-label">External Port <span class="text-danger">*</span></label>
             <input class="form-control" id="tf-pf-ext-port" type="number" placeholder="8080" min="1" max="65535">
           </div>
           <div class="col-sm-4">
-            <label class="form-label">IP Interno <span class="text-danger">*</span></label>
+            <label class="form-label">Internal IP <span class="text-danger">*</span></label>
             <input class="form-control" id="tf-pf-int-ip" placeholder="192.168.1.100">
           </div>
           <div class="col-sm-2">
-            <label class="form-label">Porta Interna <span class="text-danger">*</span></label>
+            <label class="form-label">Internal Port <span class="text-danger">*</span></label>
             <input class="form-control" id="tf-pf-int-port" type="number" placeholder="80" min="1" max="65535">
           </div>
           <div class="col-sm-6">
-            <label class="form-label">Descrição</label>
+            <label class="form-label">Description</label>
             <input class="form-control" id="tf-pf-desc" placeholder="Servidor Web">
           </div>
           <div class="col-sm-3 d-flex align-items-end">
             <div class="form-check">
               <input class="form-check-input" type="checkbox" id="tf-pf-enabled" checked>
-              <label class="form-check-label">Habilitada</label>
+              <label class="form-check-label">Enabled</label>
             </div>
           </div>
         </div>
@@ -1495,9 +2103,9 @@ const TASK_FORMS = {
 
       <div id="tf-pf-remove-fields" style="display:none">
         <div class="col-sm-4">
-          <label class="form-label">Número da instância <span class="text-danger">*</span></label>
+          <label class="form-label">Instance number <span class="text-danger">*</span></label>
           <input class="form-control" id="tf-pf-instance" type="number" placeholder="1" min="1">
-          <div class="form-text">Use a ação "Listar regras" primeiro para obter o número.</div>
+          <div class="form-text">Use the "List rules" action first to get the number.</div>
         </div>
       </div>
     </div>`,
@@ -1526,7 +2134,7 @@ function addKvRow(k = '', v = '') {
   row.className = 'kv-row';
   row.innerHTML = `
     <input class="form-control form-control-sm kv-key" placeholder="Device.X.Y" value="${escHtml(k)}">
-    <input class="form-control form-control-sm kv-val" placeholder="valor" value="${escHtml(v)}">
+    <input class="form-control form-control-sm kv-val" placeholder="value" value="${escHtml(v)}">
     <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.parentElement.remove()">
       <i class="bi bi-x"></i>
     </button>`;
@@ -1541,14 +2149,23 @@ async function submitTask() {
     switch (type) {
       case 'wifi': {
         const enabled = document.getElementById('tf-enabled').checked;
+        const bandSel = document.getElementById('tf-band').value;
+        const steeringOn = bandSel === 'steering';
+        const band = steeringOn ? '2.4' : bandSel;
+        const security = document.getElementById('tf-security').value;
+        const password = document.getElementById('tf-pass').value;
+        
         payload = {
-          band:     document.getElementById('tf-band').value,
+          band,
           ssid:     document.getElementById('tf-ssid').value,
-          password: document.getElementById('tf-pass').value,
+          password: password,
+          security: security,
           channel:  parseInt(document.getElementById('tf-channel').value) || 0,
           enabled,
+          band_steering_enabled: steeringOn,
         };
-        if (!payload.ssid) throw new Error('SSID é obrigatório');
+        if (!payload.ssid) throw new Error('SSID is required');
+        if (security !== 'None' && password.length < 8) throw new Error('Password must be at least 8 characters');
         break;
       }
       case 'wan': {
@@ -1561,6 +2178,7 @@ async function submitTask() {
         if (wanType === 'pppoe') {
           payload.username = document.getElementById('tf-wan-user').value;
           payload.password = document.getElementById('tf-wan-pass').value;
+          payload.ipv6_enabled = document.getElementById('tf-ipv6-en').checked;
         } else if (wanType === 'static') {
           payload.ip_address  = document.getElementById('tf-wan-ip').value;
           payload.subnet_mask = document.getElementById('tf-wan-mask').value;
@@ -1587,8 +2205,8 @@ async function submitTask() {
       case 'web-admin': {
         const pass  = document.getElementById('tf-webadmin-pass').value;
         const pass2 = document.getElementById('tf-webadmin-pass2').value;
-        if (!pass) throw new Error('A senha não pode ser vazia');
-        if (pass !== pass2) throw new Error('As senhas não coincidem');
+        if (!pass) throw new Error('Password cannot be empty');
+        if (pass !== pass2) throw new Error('Passwords do not match');
         payload = { password: pass };
         break;
       }
@@ -1605,13 +2223,13 @@ async function submitTask() {
           const v = row.querySelector('.kv-val').value.trim();
           if (k) params[k] = v;
         });
-        if (Object.keys(params).length === 0) throw new Error('Adicione ao menos um parâmetro');
+        if (Object.keys(params).length === 0) throw new Error('Add at least one parameter');
         payload = { parameters: params };
         break;
       }
       case 'firmware': {
         const url = document.getElementById('tf-fw-url').value.trim();
-        if (!url) throw new Error('URL é obrigatória');
+        if (!url) throw new Error('URL is required');
         payload = {
           url,
           version:   document.getElementById('tf-fw-version').value,
@@ -1623,7 +2241,7 @@ async function submitTask() {
       }
       case 'ping': {
         const host = document.getElementById('tf-ping-host').value.trim();
-        if (!host) throw new Error('Host é obrigatório');
+        if (!host) throw new Error('Host is required');
         payload = {
           host,
           count:       parseInt(document.getElementById('tf-ping-count').value) || 4,
@@ -1635,7 +2253,7 @@ async function submitTask() {
       }
       case 'traceroute': {
         const host = document.getElementById('tf-tr-host').value.trim();
-        if (!host) throw new Error('Host é obrigatório');
+        if (!host) throw new Error('Host is required');
         payload = {
           host,
           max_hops: parseInt(document.getElementById('tf-tr-maxhops').value) || 30,
@@ -1645,7 +2263,7 @@ async function submitTask() {
       }
       case 'speed-test': {
         const url = document.getElementById('tf-st-url').value.trim();
-        if (!url) throw new Error('URL de download é obrigatória');
+        if (!url) throw new Error('Download URL is required');
         payload = { download_url: url };
         break;
       }
@@ -1656,7 +2274,7 @@ async function submitTask() {
           const extPort = parseInt(document.getElementById('tf-pf-ext-port').value);
           const intPort = parseInt(document.getElementById('tf-pf-int-port').value);
           const intIP   = document.getElementById('tf-pf-int-ip').value.trim();
-          if (!extPort || !intIP || !intPort) throw new Error('Porta externa, IP interno e porta interna são obrigatórios');
+          if (!extPort || !intIP || !intPort) throw new Error('External port, internal IP and internal port are required');
           const enabled = document.getElementById('tf-pf-enabled').checked;
           payload = {
             action,
@@ -1669,7 +2287,7 @@ async function submitTask() {
           };
         } else if (action === 'remove') {
           const instance = parseInt(document.getElementById('tf-pf-instance').value);
-          if (!instance) throw new Error('Número da instância é obrigatório');
+          if (!instance) throw new Error('Instance number is required');
           payload = { action, instance_number: instance };
         }
         break;
@@ -1679,9 +2297,15 @@ async function submitTask() {
     const btn = document.getElementById('task-submit-btn');
     btn.disabled = true;
     try {
-      const t = await API.post(`/devices/${encodeURIComponent(_taskSerial)}/tasks/${type}`, payload);
+      let t = await API.post(`/devices/${encodeURIComponent(_taskSerial)}/tasks/${type}`, payload);
+      
+      // If the API wrapped the task in a response object (like CreateWifi does)
+      if (t && t.task && t.task.id) {
+        t = t.task;
+      }
+      
       S.taskModal.hide();
-      toast(`Tarefa ${taskTypeLabel(t.type)} criada (${t.id.substring(0,8)}…)`);
+      toast(`Task ${taskTypeLabel(t.type)} created (${t.id.substring(0,8)}…)`);
       // Switch to tasks tab
       const tab = document.querySelector('[href="#tab-tasks"]');
       if (tab) { bootstrap.Tab.getOrCreateInstance(tab).show(); }
@@ -1727,7 +2351,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const res = await API.login(u, p);
-      if (!res.token) throw new Error(res.error || 'Credenciais inválidas');
+      if (!res.token) throw new Error(res.error || 'Invalid credentials');
       S.token = res.token;
       localStorage.setItem('helixToken', res.token);
       setTopbarUser(u);

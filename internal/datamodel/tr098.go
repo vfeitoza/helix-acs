@@ -194,7 +194,8 @@ func (m *TR098Mapper) WANMACPath() string {
 	return fmt.Sprintf("InternetGatewayDevice.WANDevice.%d.WANEthernetInterfaceConfig.MACAddress", m.wanDev())
 }
 func (m *TR098Mapper) WANStatusPath() string {
-	return fmt.Sprintf("%s.WANIPConnection.%d.ConnectionStatus", m.wanBase(), m.wanIPConn())
+	// TR-098 GPON ONUs commonly report active internet state on WANPPPConnection.
+	return fmt.Sprintf("%s.WANPPPConnection.%d.ConnectionStatus", m.wanBase(), m.wanPPPConn())
 }
 func (m *TR098Mapper) WANBytesSentPath() string {
 	return fmt.Sprintf("InternetGatewayDevice.WANDevice.%d.WANCommonInterfaceConfig.TotalBytesSent", m.wanDev())
@@ -307,3 +308,15 @@ func (m *TR098Mapper) PortMappingCountPath() string {
 // proprietary X_ extension. Callers should fall back to TypeSetParams with
 // the vendor-specific path when this returns an empty string.
 func (m *TR098Mapper) WebAdminPasswordPath() string { return "" }
+
+// SupportsWiFiAccessPoint returns false for TR-098 which uses vendor-specific WiFi paths.
+func (m *TR098Mapper) SupportsWiFiAccessPoint() bool { return false }
+
+// WANServiceTypePath returns "" for TR-098; no standard service-type label exists.
+func (m *TR098Mapper) WANServiceTypePath() string { return "" }
+
+// BandSteeringPath returns "" for TR-098; vendor schemas override this.
+func (m *TR098Mapper) BandSteeringPath() string { return "" }
+
+// WANProvisioningType returns "set_params" for generic TR-098 devices.
+func (m *TR098Mapper) WANProvisioningType() string { return "set_params" }

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 // XML namespace constants used across all CWMP envelopes.
 const (
 	soapEnvNS = "http://schemas.xmlsoap.org/soap/envelope/"
-	cwmpNS    = "urn:dslforum-org:cwmp-1-2"
+	cwmpNS    = "urn:dslforum-org:cwmp-1-0"
 	xsdNS     = "http://www.w3.org/2001/XMLSchema"
 	xsiNS     = "http://www.w3.org/2001/XMLSchema-instance"
 )
@@ -107,6 +109,7 @@ type EventStruct struct {
 // ParameterValueList wraps a slice of ParameterValueStruct items. It is reused
 // in Inform, GetParameterValuesResponse, and SetParameterValues.
 type ParameterValueList struct {
+	ArrayType             string                 `xml:"soap-enc:arrayType,attr,omitempty"`
 	ParameterValueStructs []ParameterValueStruct `xml:"ParameterValueStruct"`
 }
 
@@ -325,14 +328,22 @@ func BuildEnvelope(id string, body Body) ([]byte, error) {
 	_, _ = buf.WriteString(xml.Header)
 
 	enc := xml.NewEncoder(&buf)
-	enc.Indent("", "  ")
 	if err := enc.Encode(env); err != nil {
 		return nil, fmt.Errorf("cwmp: failed to encode SOAP envelope: %w", err)
 	}
 	if err := enc.Flush(); err != nil {
 		return nil, fmt.Errorf("cwmp: failed to flush SOAP encoder: %w", err)
 	}
-	return buf.Bytes(), nil
+
+	// Post-process: rename 'soap:' prefix to 'soap-env:' and add soap-enc
+	// namespace. Many CPEs (especially TP-Link) use hard-coded string matching
+	// for namespace prefixes instead of proper XML namespace resolution.
+	out := buf.String()
+	out = strings.ReplaceAll(out, "xmlns:soap=", "xmlns:soap-enc=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:soap-env=")
+	out = strings.ReplaceAll(out, "soap:", "soap-env:")
+	// Fix Value type attribute: type="xsd:..." → xsi:type="xsd:..."
+	out = strings.ReplaceAll(out, " type=\"xsd:", " xsi:type=\"xsd:")
+	return []byte(out), nil
 }
 
 // BuildInformResponse constructs a SOAP envelope containing an InformResponse
@@ -365,12 +376,72 @@ func BuildGetParameterValues(id string, names []string) ([]byte, error) {
 // xsd:string; callers that need specific xsd types should build the
 // ParameterValueList directly and call BuildEnvelope.
 func BuildSetParameterValues(id string, params map[string]string) ([]byte, error) {
+	// Sort parameter names to ensure consistent ordering, with security passwords first
+	var sortedNames []string
+	for name := range params {
+		sortedNames = append(sortedNames, name)
+	}
+
+	// Custom sort: disable first → VLAN/credentials → enable last
+	// This supports the disable-modify-enable pattern for VLAN/credential updates
+	sort.Slice(sortedNames, func(i, j int) bool {
+		iName := sortedNames[i]
+		jName := sortedNames[j]
+		iVal := params[iName]
+		jVal := params[jName]
+
+		// Extract leaf parameter name
+		iParts := strings.Split(iName, ".")
+		iLeaf := iParts[len(iParts)-1]
+		jParts := strings.Split(jName, ".")
+		jLeaf := jParts[len(jParts)-1]
+
+		// Priority 0: Enable=0 (disable must come first)
+		iIsDisable := iLeaf == "Enable" && iVal == "0"
+		jIsDisable := jLeaf == "Enable" && jVal == "0"
+		if iIsDisable != jIsDisable {
+			return iIsDisable // disable comes first
+		}
+
+		// Priority 1: VLAN changes (must be set BEFORE credentials that trigger reconnect)
+		iIsVLAN := strings.Contains(iName, "VLANTermination") && iLeaf == "VLANID"
+		jIsVLAN := strings.Contains(jName, "VLANTermination") && jLeaf == "VLANID"
+		if iIsVLAN != jIsVLAN {
+			return iIsVLAN // VLAN comes next
+		}
+
+		// Priority 2: Security parameters (Username, Password, KeyPassphrase, PreSharedKey)
+		iIsSecure := iLeaf == "Username" || iLeaf == "Password" || iLeaf == "KeyPassphrase" || iLeaf == "PreSharedKey"
+		jIsSecure := jLeaf == "Username" || jLeaf == "Password" || jLeaf == "KeyPassphrase" || jLeaf == "PreSharedKey"
+		if iIsSecure != jIsSecure {
+			return iIsSecure // security params come next
+		}
+
+		// Priority 3: Other Enable parameters that are 1 (re-enable must come last)
+		iIsEnable := iLeaf == "Enable" && iVal == "1"
+		jIsEnable := jLeaf == "Enable" && jVal == "1"
+		if iIsEnable != jIsEnable {
+			return !iIsEnable // enable=1 comes last (invert to put false first)
+		}
+
+		// Priority 4: ModeEnabled/EncryptionMode (must be set last, after re-enable)
+		iIsMode := iLeaf == "ModeEnabled" || iLeaf == "EncryptionMode"
+		jIsMode := jLeaf == "ModeEnabled" || jLeaf == "EncryptionMode"
+		if iIsMode != jIsMode {
+			return !iIsMode // modes come last (invert to put false first)
+		}
+
+		// Otherwise maintain consistent ordering
+		return iName < jName
+	})
+
 	pvs := make([]ParameterValueStruct, 0, len(params))
-	for name, val := range params {
+	for _, name := range sortedNames {
+		val := params[name]
 		pvs = append(pvs, ParameterValueStruct{
 			Name: name,
 			Value: Value{
-				Type: "xsd:string",
+				Type: inferXSDType(name, val),
 				Data: val,
 			},
 		})
@@ -378,12 +449,51 @@ func BuildSetParameterValues(id string, params map[string]string) ([]byte, error
 	body := Body{
 		SetParameterValues: &SetParameterValues{
 			ParameterList: ParameterValueList{
+				ArrayType:             fmt.Sprintf("cwmp:ParameterValueStruct[%d]", len(pvs)),
 				ParameterValueStructs: pvs,
 			},
-			ParameterKey: id,
+			ParameterKey: "",
 		},
 	}
 	return BuildEnvelope(id, body)
+}
+
+// inferXSDType returns the appropriate XSD type for a CWMP parameter based on
+// the parameter name and value. TP-Link devices reject SetParameterValues when
+// the xsi:type does not match their internal schema.
+func inferXSDType(paramName, value string) string {
+	// Last segment of the dotted path (e.g. "Enable", "VLANID").
+	parts := strings.Split(paramName, ".")
+	leaf := parts[len(parts)-1]
+
+	// String-typed parameters that contain "Enabled" but should be strings
+	// (e.g., Security.ModeEnabled is a string like "WPA2-Personal" or "None")
+	if leaf == "ModeEnabled" {
+		return "xsd:string"
+	}
+
+	// Boolean-typed parameters: anything containing "Enable" or "Mcast"
+	if strings.Contains(leaf, "Enable") || leaf == "RequestAddresses" ||
+		leaf == "RequestPrefixes" || strings.HasSuffix(leaf, "Mcast") {
+		return "xsd:boolean"
+	}
+
+	// Known unsigned integer fields
+	switch leaf {
+	case "VLANID", "MaxMTUSize", "NumberOfRepetitions", "PeriodicInformInterval",
+		"MaxMTU", "Status", "X_TP_VLANMode", "Port", "Channel", "TransmitPower",
+		"OperatingChannelBandwidth", "MaxBitRate", "RSSI", "X_TP_TxPower",
+		"AssociatedDeviceNumberOfEntries":
+		return "xsd:unsignedInt"
+	}
+
+	// Known signed integer fields (default value can be negative, e.g. -1)
+	switch leaf {
+	case "X_TP_MulticastStatus":
+		return "xsd:int"
+	}
+
+	return "xsd:string"
 }
 
 // BuildReboot constructs a Reboot request envelope.
@@ -422,7 +532,7 @@ func BuildAddObject(id, objectName string) ([]byte, error) {
 	body := Body{
 		AddObject: &AddObject{
 			ObjectName:   objectName,
-			ParameterKey: id,
+			ParameterKey: "", // TP-Link devices expect empty ParameterKey
 		},
 	}
 	return BuildEnvelope(id, body)
@@ -435,6 +545,18 @@ func BuildDeleteObject(id, objectName string) ([]byte, error) {
 		DeleteObject: &DeleteObject{
 			ObjectName:   objectName,
 			ParameterKey: id,
+		},
+	}
+	return BuildEnvelope(id, body)
+}
+
+// BuildGetParameterNames constructs a GetParameterNames request envelope.
+// Set nextLevel=false to request the full recursive parameter tree under path.
+func BuildGetParameterNames(id, path string, nextLevel bool) ([]byte, error) {
+	body := Body{
+		GetParameterNames: &GetParameterNames{
+			ParameterPath: path,
+			NextLevel:     nextLevel,
 		},
 	}
 	return BuildEnvelope(id, body)

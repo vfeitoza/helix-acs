@@ -10,13 +10,33 @@ import (
 	"github.com/raykavin/helix-acs/internal/datamodel"
 )
 
+// DriverHints provides vendor-specific configuration to the executor without
+// creating a direct dependency on the schema package.
+type DriverHints struct {
+	// BandSteeringPath is the vendor-specific TR-069 path for band steering.
+	// Empty means band steering is not supported.
+	BandSteeringPath string
+
+	// SecurityModeMapper maps UI security mode labels to TR-069 values.
+	// If nil, a hardcoded default mapping is used.
+	SecurityModeMapper func(uiMode string) string
+}
+
 // Executor converts Task payloads into the parameter maps / name lists that
 // the CWMP session handler needs to build SetParameterValues and
 // GetParameterValues requests.
-type Executor struct{}
+type Executor struct {
+	Hints *DriverHints
+}
 
-// NewExecutor returns a ready-to-use Executor.
+// NewExecutor returns a ready-to-use Executor with no vendor hints.
 func NewExecutor() *Executor { return &Executor{} }
+
+// NewExecutorWithHints returns an Executor that uses the given driver hints
+// for vendor-specific behaviour.
+func NewExecutorWithHints(hints *DriverHints) *Executor {
+	return &Executor{Hints: hints}
+}
 
 // BuildSetParams converts a task into a map of TR-069 parameter path → value
 // suitable for a SetParameterValues RPC. Returns (nil, nil) for task types
@@ -25,33 +45,9 @@ func (e *Executor) BuildSetParams(ctx context.Context, t *Task, mapper datamodel
 	_ = ctx
 	switch t.Type {
 
-	// WiFi
+	// WiFi is handled by driver YAML flow in cwmp/session.go.
 	case TypeWifi:
-		var p WiFiPayload
-		if err := json.Unmarshal(t.Payload, &p); err != nil {
-			return nil, fmt.Errorf("unmarshal wifi payload: %w", err)
-		}
-		bandIdx := 0
-		if p.Band == "5" {
-			bandIdx = 1
-		}
-		params := make(map[string]string)
-		if p.SSID != "" {
-			params[mapper.WiFiSSIDPath(bandIdx)] = p.SSID
-		}
-		if p.Password != "" {
-			params[mapper.WiFiPasswordPath(bandIdx)] = p.Password
-		}
-		if p.Enabled != nil {
-			params[mapper.WiFiEnabledPath(bandIdx)] = strconv.FormatBool(*p.Enabled)
-		}
-		if p.Channel != 0 {
-			params[mapper.WiFiChannelPath(bandIdx)] = strconv.Itoa(p.Channel)
-		}
-		if len(params) == 0 {
-			return nil, fmt.Errorf("wifi payload has no settable fields")
-		}
-		return params, nil
+		return nil, fmt.Errorf("wifi set params is handled by driver YAML flow")
 
 	// WAN
 	case TypeWAN:
@@ -72,9 +68,9 @@ func (e *Executor) BuildSetParams(ctx context.Context, t *Task, mapper datamodel
 		if p.IPAddress != "" {
 			params[mapper.WANIPAddressPath()] = p.IPAddress
 		}
-		if p.MTU > 0 {
-			params[mapper.WANMTUPath()] = strconv.Itoa(p.MTU)
-		}
+		// MTU is skipped intentionally: MaxMTUSize causes type-fault on some
+		// TP-Link devices; MTU is better managed via IP interface provisioning.
+		_ = p.MTU
 		if len(params) == 0 {
 			return nil, fmt.Errorf("wan payload has no settable fields")
 		}
@@ -238,9 +234,19 @@ func (e *Executor) BuildGetParams(ctx context.Context, t *Task, mapper datamodel
 		return names, nil
 
 	case TypeConnectedDevices:
-		// Fetch the entire Hosts sub-tree; the response will contain all
-		// Host.{i}.* parameters which we parse into ConnectedHost structs.
-		return []string{mapper.HostsBasePath()}, nil
+		// Fetch Hosts sub-tree and WiFi associated devices for RSSI.
+		// TR-181: Device.WiFi.AccessPoint.{i}.AssociatedDevice.{i}.SignalStrength
+		// TR-098: InternetGatewayDevice.LANDevice.1.WLANConfiguration.{i}.AssociatedDevice.{i}.{RSSI|SignalStrength}
+		paths := []string{mapper.HostsBasePath()}
+		if mapper.SupportsWiFiAccessPoint() {
+			// TR-181: fetch AccessPoint subtree for RSSI via AssociatedDevice ref.
+			paths = append(paths, "Device.WiFi.AccessPoint.")
+		} else {
+			// TR-098: fetch all WLANConfiguration AssociatedDevice subtrees
+			// to cross-reference host MACs with RSSI values.
+			paths = append(paths, "InternetGatewayDevice.LANDevice.1.WLANConfiguration.")
+		}
+		return paths, nil
 
 	case TypeCPEStats:
 		return buildCPEStatsPaths(mapper), nil
@@ -311,3 +317,4 @@ func BuildDiagResultPaths(taskType Type, mapper datamodel.Mapper) []string {
 	}
 	return nil
 }
+

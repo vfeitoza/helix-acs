@@ -63,10 +63,22 @@ func normaliseVendor(manufacturer string) string {
 		return ""
 	}
 
-	// Well-known vendor prefixes → canonical slug.
-	for prefix, slug := range knownVendors {
+	// Sort prefixes by length descending so "zteg" matches before "zte".
+	var prefixes []string
+	for p := range knownVendors {
+		prefixes = append(prefixes, p)
+	}
+	for i := 0; i < len(prefixes); i++ {
+		for j := i + 1; j < len(prefixes); j++ {
+			if len(prefixes[i]) < len(prefixes[j]) {
+				prefixes[i], prefixes[j] = prefixes[j], prefixes[i]
+			}
+		}
+	}
+
+	for _, prefix := range prefixes {
 		if strings.HasPrefix(s, prefix) {
-			return slug
+			return knownVendors[prefix]
 		}
 	}
 
@@ -81,19 +93,30 @@ func normaliseVendor(manufacturer string) string {
 // knownVendors maps lower-case manufacturer name prefixes to canonical slugs.
 // Add new entries here or extend with a config file as needed.
 var knownVendors = map[string]string{
-	"huawei":   "huawei",
-	"zte":      "zte",
-	"tp-link":  "tplink",
-	"tp link":  "tplink",
-	"tplink":   "tplink",
-	"fiberhome": "fiberhome",
-	"intelbras": "intelbras",
-	"datacom":  "datacom",
-	"nokia":    "nokia",
-	"ericsson": "ericsson",
-	"sagemcom": "sagemcom",
+	"huawei":      "huawei",
+	"zte":         "zte",
+	"tp-link":     "tplink",
+	"tp link":     "tplink",
+	"tplink":      "tplink",
+	"fiberhome":   "fiberhome",
+	"intelbras":   "intelbras",
+	"datacom":     "datacom",
+	"nokia":       "nokia",
+	"ericsson":    "ericsson",
+	"sagemcom":    "sagemcom",
 	"technicolor": "technicolor",
-	"arcadyan": "arcadyan",
-	"sercomm":  "sercomm",
-	"askey":    "askey",
+	"arcadyan":    "arcadyan",
+	"sercomm":     "sercomm",
+	"askey":       "askey",
+	// C-DATA ONUs (GPON/EPON) — chipset ZTE, reports "ZTEG" as manufacturer.
+	// FD514GD-R460 series reports "CDTC" as manufacturer (OUI 505B1D).
+	"zteg":   "cdata",
+	"c-data": "cdata",
+	"cdata":  "cdata",
+	"cdtc":   "cdata",
+
+	// Ruijie Networks (OUI DC4EF4) — EW3000P and similar GPON ONTs
+	// report manufacturer as "MTN" (OEM branding).
+	"mtn":    "ruijie",
+	"ruijie": "ruijie",
 }
